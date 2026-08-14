@@ -1,0 +1,42 @@
+{
+  "admin_user_ids": [123456789],
+
+  "userbots": [
+    {
+      "name": "ub1",
+      "session": "ub1",
+      "source_channels": ["@examplecall1", "@examplecall2"],
+      "chains": ["sol", "evm"],
+      "dedup_hours": 0,
+      "delay_between_groups_sec": 5,
+      "attribution": true,
+      "template": null,
+      "send_filter": {
+        "mode": "allowlist",
+        "allowlist": ["@yourgroup1", -1001234567890],
+        "blocklist": [],
+        "title_contains": [],
+        "include_channels": false,
+        "dry_run": true
+      }
+    },
+    {
+      "name": "ub2",
+      "session": "ub2",
+      "source_channels": ["@examplecall3"],
+      "chains": ["sol"],
+      "dedup_hours": 24,
+      "delay_between_groups_sec": 6,
+      "attribution": true,
+      "template": null,
+      "send_filter": {
+        "mode": "allowlist",
+        "allowlist": ["Alpha VIP"],
+        "blocklist": [],
+        "title_contains": [],
+        "include_channels": false,
+        "dry_run": true
+      }
+    }
+  ]
+}

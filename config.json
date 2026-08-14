@@ -1,0 +1,17 @@
+{
+  "source_channels": ["@examplecallchannel1", "@examplecallchannel2"],
+  "chains": ["sol", "evm"],
+  "dedup_hours": 0,
+  "delay_between_groups_sec": 5,
+  "attribution": true,
+  "template": null,
+
+  "send_filter": {
+    "mode": "allowlist",
+    "allowlist": ["@yourgroup1", -1001234567890, "Alpha VIP"],
+    "blocklist": [],
+    "title_contains": [],
+    "include_channels": false,
+    "dry_run": true
+  }
+}
