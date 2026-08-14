@@ -53,21 +53,66 @@ Semua userbot **share satu `api_id`/`api_hash`** (api_id itu per-app, bukan per-
 
 ## Control bot commands (chat langsung ke bot)
 
+### Tambah akun (nomor HP) — tanpa restart
+
+| Command | Fungsi |
+|---|---|
+| `/addnumber <name> <+62...>` | Bikin userbot baru + kirim OTP ke nomor itu |
+| `/code <name> <kode>` | Masukin OTP. Angka doang yang dibaca, jadi boleh dipisah spasi |
+| `/pass <name> <password>` | Kalau akunnya pakai 2FA |
+| `/cancel <name>` | Batalin login yang lagi nunggu |
+| `/delbot <name>` | Copot userbot dari fleet (file session tetep di disk) |
+
+Contoh:
+```
+/addnumber ub3 +628123456789
+   → "kode dikirim, balas /code ub3 <kode>"
+/code ub3 1 2 3 4 5
+   → ✅ login, langsung masuk fleet dalam keadaan dry-run + 0 target
+```
+
+> ⚠️ **Telegram nge-invalidate kode login yang ditulis mentahan di chat Telegram.** Makanya `/code` nerima angka yang dipisah (`1 2 3 4 5`, `12-345`) — non-digit dibuang otomatis. Habis login, **hapus pesan kodenya**. Kalau kodenya kadung mati, ulang `/addnumber`.
+
+Userbot baru selalu lahir **aman**: `dry_run: true`, 0 source, allowlist kosong — jadi nggak bakal ngirim apa-apa sebelum lo isi sendiri.
+
+### Pilih source channel & target group (bernomor)
+
+| Command | Fungsi |
+|---|---|
+| `/listchannels <bot> [keyword]` | Channel yang di-join akun itu, bernomor. `keyword` nyaring by judul/@username. ✅ = udah jadi source |
+| `/addsource <bot> <#1,3>` `/delsource <bot> <#1,3>` | Pilih/buang source pakai nomor dari listing barusan (`@channel` tetep bisa) |
+| `/listgroups <bot> [keyword]` | Group yang di-join, bernomor. ✅ = udah jadi target |
+| `/allow <bot> <#1,3>` `/unallow <bot> <#1,3>` | Pilih/buang target group pakai nomor (`@grp`/id/substring tetep bisa) |
+| `/titlefilter <bot> <kata\|clear>` | Saring target: cuma group yang judulnya ngandung kata itu |
+| `/groups <bot>` | Target yang kepilih sekarang (hasil akhir semua filter) |
+
+Alur normalnya:
+```
+/listchannels ub3 call     →  daftar channel yang judulnya ada "call"
+/addsource ub3 #1,2,5      →  jadiin source
+/listgroups ub3            →  daftar group
+/allow ub3 #1,3            →  jadiin target
+/groups ub3                →  cek hasil akhir
+/dryrun ub3 off            →  baru live
+```
+Nomor `#n` ngikutin listing **terakhir** buat bot itu. Habis join/leave group baru, jalanin listing-nya lagi biar nomornya fresh.
+
+### Operasi harian
+
 | Command | Fungsi |
 |---|---|
 | `/status` | Overview semua userbot: state (live/dry/paused), jumlah source→group, counter |
 | `/pause <bot\|all>` `/resume <bot\|all>` | Stop/lanjut kirim (tetep listen, cuma nahan send) |
 | `/dryrun <bot\|all> <on\|off>` | Toggle preview-only |
 | `/delay <bot> <sec>` | Ubah jeda antar group |
-| `/sources <bot>` | List source channel |
-| `/addsource <bot> <@ch>` `/delsource <bot> <@ch>` | Tambah/hapus source live |
+| `/sources <bot>` | List source channel yang aktif |
 | `/mode <bot> <allowlist\|blocklist\|all>` | Ganti mode filter group |
-| `/allow <bot> <@grp\|id\|substr>` `/unallow <bot> <entry>` | Edit allowlist (auto re-resolve target) |
-| `/groups <bot>` | List target group yang match filter sekarang |
 | `/reload <bot\|all>` | Re-resolve source+group (habis join/leave group baru) |
 | `/stats <bot\|all>` | Counter: relayed / dup skip / send ok / fail |
 
 Semua perubahan lewat command langsung ke-save ke `fleet.json`. Non-admin yang chat bot → di-ignore diam-diam.
+
+Karena akun bisa ditambah lewat chat, `fleet.json` boleh mulai dengan `"userbots": []` — asal `CONTROL_BOT_TOKEN` keisi, prosesnya tetep jalan dan lo tinggal `/addnumber`.
 
 ## fleet.json
 

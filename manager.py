@@ -34,7 +34,14 @@ from pathlib import Path
 import base58
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, utils
-from telethon.errors import FloodWaitError, ChatWriteForbiddenError
+from telethon.errors import (
+    ChatWriteForbiddenError,
+    FloodWaitError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    PhoneNumberInvalidError,
+    SessionPasswordNeededError,
+)
 
 BASE = Path(__file__).parent
 load_dotenv(BASE / ".env")
@@ -59,8 +66,9 @@ with open(FLEET_PATH) as f:
 
 ADMIN_IDS = set(FLEET_CONFIG.get("admin_user_ids", []))
 USERBOT_CFGS = FLEET_CONFIG.get("userbots", [])
-if not USERBOT_CFGS:
-    raise SystemExit("fleet.json needs at least one userbot in 'userbots'")
+if not USERBOT_CFGS and not CONTROL_BOT_TOKEN:
+    raise SystemExit("fleet.json needs at least one userbot in 'userbots' — or set "
+                     "CONTROL_BOT_TOKEN and add one live with /addnumber")
 
 
 def save_fleet():
@@ -178,6 +186,12 @@ def dialog_name(d):
     return f"{title} (@{uname})" if uname else f"{title} [{d.id}]"
 
 
+def dialog_ref(d):
+    """Config-friendly reference to a dialog: @username when it has one, else id."""
+    u = getattr(d.entity, "username", None)
+    return f"@{u}" if u else d.id
+
+
 def dialog_matches(d, entry):
     ent = d.entity
     if isinstance(entry, int):
@@ -242,6 +256,9 @@ class Userbot:
         self.inflight = set()             # CAs queued but not yet committed to the dedup db
         self.paused = False
         self.counters = {"relayed": 0, "dup_skips": 0, "sends_ok": 0, "sends_fail": 0}
+        self.listing = {"channel": [], "group": []}   # last /listchannels + /listgroups result
+        self.sender_task = None
+        self.runner = None
 
     async def refresh_sources(self):
         self.source_ids.clear()
@@ -267,6 +284,138 @@ def find_bots(selector):
     if selector == "all":
         return list(FLEET)
     return [b for b in FLEET if b.name == selector]
+
+
+# ---------------------------------------------------------------- dialog pickers
+
+MAX_LIST = 40   # keep a listing under Telegram's 4096-char message cap
+
+
+async def collect_dialogs(bot, kind, keyword=None):
+    """Joined dialogs of one kind ('channel' = broadcast, 'group'), title/@name filtered."""
+    out = []
+    for d in await bot.client.get_dialogs():
+        if d.is_user:
+            continue
+        is_broadcast = d.is_channel and not d.is_group
+        if kind == "channel" and not is_broadcast:
+            continue
+        if kind == "group" and not d.is_group:
+            continue
+        if keyword:
+            k = keyword.lower()
+            title = (getattr(d.entity, "title", "") or "").lower()
+            uname = (getattr(d.entity, "username", "") or "").lower()
+            if k not in title and k not in uname:
+                continue
+        out.append(d)
+    return out
+
+
+def render_listing(dialogs, chosen_ids):
+    lines = []
+    for i, d in enumerate(dialogs[:MAX_LIST], start=1):
+        mark = "✅" if d.id in chosen_ids else "▫️"
+        u = getattr(d.entity, "username", None)
+        tail = f" (@{u})" if u else f" [`{d.id}`]"
+        lines.append(f"`{i:>2}` {mark} {getattr(d.entity, 'title', '?') or '?'}{tail}")
+    if len(dialogs) > MAX_LIST:
+        lines.append(f"_…{len(dialogs) - MAX_LIST} lagi — persempit pakai keyword_")
+    return lines
+
+
+def is_index_arg(tokens):
+    """True when the user is picking by number: '#1,3' / '#1 #3'."""
+    return bool(tokens) and tokens[0].startswith("#")
+
+
+def parse_indices(tokens, dialogs):
+    """'#1,3 #5' -> ([dialog, ...], [bad token, ...]) against the cached listing."""
+    picked, bad = [], []
+    for tok in tokens:
+        for part in tok.replace("#", " ").replace(",", " ").split():
+            if not part.isdigit():
+                bad.append(part)
+                continue
+            i = int(part)
+            if 1 <= i <= len(dialogs[:MAX_LIST]):
+                picked.append(dialogs[i - 1])
+            else:
+                bad.append(part)
+    return picked, bad
+
+
+# ---------------------------------------------------------------- live userbot attach / detach
+
+def new_bot_cfg(name, session):
+    """Safe defaults for a freshly added account: dry-run on, nothing targeted yet."""
+    return {
+        "name": name,
+        "session": session,
+        "source_channels": [],
+        "chains": ["sol", "evm"],
+        "dedup_hours": 0,
+        "delay_between_groups_sec": 5,
+        "attribution": True,
+        "template": None,
+        "send_filter": {
+            "mode": "allowlist",
+            "allowlist": [],
+            "blocklist": [],
+            "title_contains": [],
+            "include_channels": False,
+            "dry_run": True,
+        },
+    }
+
+
+def make_handler(bot):
+    async def handler(event):
+        try:
+            pid = utils.get_peer_id(await event.get_chat())
+            if pid not in bot.source_ids:
+                return
+            src = bot.source_names.get(pid, "unknown")
+            for ca, chain in extract_cas(get_all_text(event.message), bot.cfg.get("chains", ["sol", "evm"])):
+                # inflight = queued by an earlier message, not committed yet
+                if ca in bot.inflight or already_posted(bot.name, ca, bot.cfg.get("dedup_hours", 0)):
+                    bot.counters["dup_skips"] += 1
+                    continue
+                bot.inflight.add(ca)
+                log.info(f"[{bot.name}] NEW {chain.upper()} {ca} from {src} -> queue")
+                await bot.queue.put((ca, chain, src))
+        except Exception as e:
+            log.error(f"[{bot.name}] handler error: {e}")
+    return handler
+
+
+async def attach_userbot(cfg, client):
+    """Wire a logged-in client into the fleet: resolve, listen, start sending."""
+    b = Userbot(cfg)
+    b.client = client
+    await b.refresh_sources()
+    await b.refresh_targets()
+    client.add_event_handler(make_handler(b), events.NewMessage())
+    b.sender_task = asyncio.create_task(sender_loop(b))
+    b.runner = asyncio.create_task(client.run_until_disconnected())
+    FLEET.append(b)
+    return b
+
+
+async def detach_userbot(bot):
+    for t in (bot.sender_task, bot.runner):
+        if t:
+            t.cancel()
+    try:
+        await bot.client.disconnect()
+    except Exception:
+        pass
+    if bot in FLEET:
+        FLEET.remove(bot)
+    FLEET_CONFIG["userbots"] = [c for c in FLEET_CONFIG.get("userbots", []) if c.get("name") != bot.name]
+
+
+PENDING_LOGINS = {}   # bot name -> {client, phone, hash, session}
 
 
 # ---------------------------------------------------------------- sender loop
@@ -335,16 +484,25 @@ async def sender_loop(bot: Userbot):
 
 HELP = (
     "**CALLRELAY control**\n\n"
-    "`/status` — all userbots overview\n"
-    "`/pause <bot|all>` · `/resume <bot|all>`\n"
-    "`/dryrun <bot|all> <on|off>`\n"
-    "`/delay <bot> <sec>`\n"
-    "`/sources <bot>` · `/addsource <bot> <@ch>` · `/delsource <bot> <@ch>`\n"
+    "**Akun**\n"
+    "`/addnumber <name> <+62...>` — tambah userbot baru (login OTP)\n"
+    "`/code <name> <kode>` · `/pass <name> <2fa>` · `/cancel <name>`\n"
+    "`/delbot <name>` — copot userbot dari fleet\n\n"
+    "**Pilih source channel**\n"
+    "`/listchannels <bot> [keyword]` — channel yang di-join, bernomor\n"
+    "`/addsource <bot> <#1,3 | @ch>` · `/delsource <bot> <#1,3 | @ch>`\n"
+    "`/sources <bot>`\n\n"
+    "**Pilih target group**\n"
+    "`/listgroups <bot> [keyword]` — group yang di-join, bernomor\n"
+    "`/allow <bot> <#1,3 | @grp|id|substr>` · `/unallow <bot> <#1,3 | entry>`\n"
     "`/mode <bot> <allowlist|blocklist|all>`\n"
-    "`/allow <bot> <@grp|id|substr>` · `/unallow <bot> <entry>`\n"
-    "`/groups <bot>` — resolved target groups\n"
-    "`/reload <bot|all>` — re-resolve sources+groups (after join/leave)\n"
-    "`/stats <bot|all>`\n"
+    "`/titlefilter <bot> <kata|clear>` — saring group by judul\n"
+    "`/groups <bot>` — target yang kepilih sekarang\n\n"
+    "**Operasi**\n"
+    "`/status` · `/stats <bot|all>`\n"
+    "`/pause <bot|all>` · `/resume <bot|all>`\n"
+    "`/dryrun <bot|all> <on|off>` · `/delay <bot> <sec>`\n"
+    "`/reload <bot|all>` — re-resolve habis join/leave\n"
 )
 
 
@@ -360,9 +518,166 @@ def register_control(control):
         async def reply(msg):
             await event.reply(msg, parse_mode="md", link_preview=False)
 
+        async def finish_login(name):
+            """Sign-in done — build the config, attach to the fleet, persist."""
+            p = PENDING_LOGINS.pop(name)
+            client = p["client"]
+            me = await client.get_me()
+            cfg = new_bot_cfg(name, p["session"])
+            FLEET_CONFIG.setdefault("userbots", []).append(cfg)
+            b = await attach_userbot(cfg, client)
+            save_fleet()
+            log.info(f"[{name}] added live as @{me.username} ({me.first_name})")
+            await reply(
+                f"✅ `{name}` login sebagai **{me.first_name}** (@{me.username})\n"
+                f"state: 🧪 dry-run · 0 source · 0 target group\n\n"
+                f"lanjut:\n"
+                f"1. `/listchannels {name}` → `/addsource {name} #1,2`\n"
+                f"2. `/listgroups {name}` → `/allow {name} #1,2`\n"
+                f"3. cek `/groups {name}` → kalau bener: `/dryrun {name} off`\n\n"
+                f"⚠️ hapus pesan kode OTP lo dari chat ini."
+            )
+
         try:
             if cmd in ("help", "start"):
                 await reply(HELP)
+
+            # ---------------------------------------------------- add account by phone
+            elif cmd in ("addnumber", "addbot"):
+                if len(args) < 2:
+                    return await reply("usage: `/addnumber <name> <+62812xxxx>`")
+                name, phone = args[0], "".join(args[1:])
+                phone = re.sub(r"[^\d+]", "", phone)
+                if name == "all":
+                    return await reply("`all` itu keyword — pilih nama lain")
+                if find_bots(name) or name in PENDING_LOGINS:
+                    return await reply(f"nama `{name}` udah kepake")
+                if not phone.startswith("+") or len(phone) < 8:
+                    return await reply("nomor harus format internasional, contoh `+628123456789`")
+                session = f"session_{name}"
+                client = TelegramClient(str(BASE / session), API_ID, API_HASH)
+                await client.connect()
+                if await client.is_user_authorized():
+                    PENDING_LOGINS[name] = {"client": client, "phone": phone, "hash": None, "session": session}
+                    return await finish_login(name)
+                try:
+                    sent = await client.send_code_request(phone)
+                except PhoneNumberInvalidError:
+                    await client.disconnect()
+                    return await reply("nomor nggak valid")
+                except FloodWaitError as e:
+                    await client.disconnect()
+                    return await reply(f"kena floodwait {e.seconds}s — coba lagi nanti")
+                except Exception as e:
+                    await client.disconnect()
+                    return await reply(f"gagal minta kode: `{e}`")
+                PENDING_LOGINS[name] = {
+                    "client": client, "phone": phone,
+                    "hash": sent.phone_code_hash, "session": session,
+                }
+                await reply(
+                    f"📲 kode dikirim ke `{phone}`.\n"
+                    f"balas: `/code {name} <kode>`\n\n"
+                    f"⚠️ Telegram nge-invalidate kode yang ditulis mentahan di chat. "
+                    f"Tulis pisah spasi — `/code {name} 1 2 3 4 5` — terus hapus pesannya.\n"
+                    f"Batal: `/cancel {name}`"
+                )
+
+            elif cmd == "code":
+                if len(args) < 2:
+                    return await reply("usage: `/code <name> <kode>`")
+                name = args[0]
+                p = PENDING_LOGINS.get(name)
+                if not p:
+                    return await reply(f"nggak ada login yang nunggu buat `{name}` — mulai `/addnumber`")
+                code = re.sub(r"\D", "", "".join(args[1:]))
+                if not code:
+                    return await reply("kodenya mana?")
+                try:
+                    await p["client"].sign_in(phone=p["phone"], code=code, phone_code_hash=p["hash"])
+                except SessionPasswordNeededError:
+                    return await reply(f"akun ini pakai 2FA → `/pass {name} <password>`")
+                except PhoneCodeInvalidError:
+                    return await reply("kode salah — coba lagi")
+                except PhoneCodeExpiredError:
+                    await p["client"].disconnect()
+                    PENDING_LOGINS.pop(name, None)
+                    return await reply("kode expired — ulang `/addnumber`")
+                except Exception as e:
+                    return await reply(f"sign-in gagal: `{e}`")
+                await finish_login(name)
+
+            elif cmd == "pass":
+                if len(args) < 2:
+                    return await reply("usage: `/pass <name> <password>`")
+                name = args[0]
+                p = PENDING_LOGINS.get(name)
+                if not p:
+                    return await reply(f"nggak ada login yang nunggu buat `{name}`")
+                try:
+                    await p["client"].sign_in(password=" ".join(args[1:]))
+                except Exception as e:
+                    return await reply(f"2FA gagal: `{e}`")
+                await finish_login(name)
+
+            elif cmd == "cancel":
+                name = args[0] if args else ""
+                p = PENDING_LOGINS.pop(name, None)
+                if not p:
+                    return await reply("nggak ada login yang nunggu")
+                await p["client"].disconnect()
+                await reply(f"login `{name}` dibatalin")
+
+            elif cmd == "delbot":
+                bots = [b for b in FLEET if b.name == (args[0] if args else "")]
+                if not bots:
+                    return await reply("usage: `/delbot <name>` (nama persis, `all` nggak dipake di sini)")
+                b = bots[0]
+                await detach_userbot(b)
+                save_fleet()
+                await reply(f"🗑 `{b.name}` dicopot dari fleet.\n"
+                            f"file session `{b.cfg.get('session')}.session` masih ada di disk — "
+                            f"hapus manual kalau mau logout beneran.")
+
+            # ---------------------------------------------------- pickers
+            elif cmd in ("listchannels", "listgroups"):
+                bots = find_bots(args[0]) if args else []
+                if not bots:
+                    return await reply(f"usage: `/{cmd} <bot> [keyword]`")
+                b = bots[0]
+                kind = "channel" if cmd == "listchannels" else "group"
+                keyword = " ".join(args[1:]) or None
+                dialogs = await collect_dialogs(b, kind, keyword)
+                b.listing[kind] = dialogs
+                if not dialogs:
+                    return await reply(f"`{b.name}` nggak punya {kind} yang cocok"
+                                       + (f" sama `{keyword}`" if keyword else ""))
+                chosen = b.source_ids if kind == "channel" else {d.id for d in b.targets}
+                head = (f"**{b.name} — {kind} ({len(dialogs)})**"
+                        + (f" filter `{keyword}`" if keyword else "")
+                        + "\n✅ = udah kepilih\n")
+                pick = (f"`/addsource {b.name} #1,3`" if kind == "channel"
+                        else f"`/allow {b.name} #1,3`")
+                await reply(head + "\n".join(render_listing(dialogs, chosen)) + f"\n\npilih: {pick}")
+
+            elif cmd == "titlefilter":
+                if len(args) < 2:
+                    return await reply("usage: `/titlefilter <bot> <kata|clear>`")
+                bots = find_bots(args[0])
+                if not bots:
+                    return await reply("no such bot")
+                b = bots[0]
+                fil = b.cfg.setdefault("send_filter", {})
+                word = " ".join(args[1:])
+                if word.lower() == "clear":
+                    fil["title_contains"] = []
+                else:
+                    fil["title_contains"] = [word]
+                await b.refresh_targets()
+                save_fleet()
+                await reply(f"`{b.name}` title filter = "
+                            f"{'(off)' if not fil['title_contains'] else '`' + word + '`'} "
+                            f"→ {len(b.targets)} group")
 
             elif cmd == "status":
                 lines = ["**Fleet status**"]
@@ -415,33 +730,43 @@ def register_control(control):
                     return await reply(f"`{b.name}` has no sources")
                 await reply(f"**{b.name} sources**\n" + "\n".join(f"• {v}" for v in b.source_names.values()))
 
-            elif cmd == "addsource":
+            elif cmd in ("addsource", "delsource"):
                 if len(args) < 2:
-                    return await reply("usage: `/addsource <bot> <@channel>`")
+                    return await reply(f"usage: `/{cmd} <bot> <#1,3 | @channel>`\n"
+                                       f"nomor `#n` ngikutin `/listchannels <bot>` terakhir")
                 bots = find_bots(args[0])
                 if not bots:
                     return await reply("no such bot")
                 b = bots[0]
-                ch = args[1]
-                b.cfg.setdefault("source_channels", [])
-                if ch not in b.cfg["source_channels"]:
-                    b.cfg["source_channels"].append(ch)
-                await b.refresh_sources()
-                save_fleet()
-                await reply(f"added source `{ch}` to `{b.name}` ({len(b.source_ids)} active)")
+                rest = args[1:]
 
-            elif cmd == "delsource":
-                if len(args) < 2:
-                    return await reply("usage: `/delsource <bot> <@channel>`")
-                bots = find_bots(args[0])
-                if not bots:
-                    return await reply("no such bot")
-                b = bots[0]
-                ch = args[1]
-                b.cfg["source_channels"] = [x for x in b.cfg.get("source_channels", []) if str(x) != ch]
+                if is_index_arg(rest):
+                    if not b.listing["channel"]:
+                        return await reply(f"jalanin `/listchannels {b.name}` dulu biar ada nomornya")
+                    picked, bad = parse_indices(rest, b.listing["channel"])
+                    if bad:
+                        return await reply(f"nomor nggak valid: {', '.join(bad)}")
+                    entries = [dialog_ref(d) for d in picked]
+                else:
+                    entries = [rest[0]]
+
+                srcs = b.cfg.setdefault("source_channels", [])
+                touched = []
+                for e in entries:
+                    if cmd == "addsource":
+                        if e not in srcs:
+                            srcs.append(e)
+                            touched.append(str(e))
+                    else:
+                        before = len(srcs)
+                        srcs[:] = [x for x in srcs if str(x) != str(e)]
+                        if len(srcs) != before:
+                            touched.append(str(e))
                 await b.refresh_sources()
                 save_fleet()
-                await reply(f"removed `{ch}` from `{b.name}` ({len(b.source_ids)} active)")
+                verb = "added" if cmd == "addsource" else "removed"
+                await reply(f"{verb}: {', '.join(f'`{t}`' for t in touched) or '(nothing)'}\n"
+                            f"`{b.name}` sekarang {len(b.source_ids)} source aktif")
 
             elif cmd == "mode":
                 if len(args) < 2 or args[1] not in ("allowlist", "blocklist", "all"):
@@ -457,23 +782,33 @@ def register_control(control):
 
             elif cmd in ("allow", "unallow"):
                 if len(args) < 2:
-                    return await reply(f"usage: `/{cmd} <bot> <@grp|id|substr>`")
+                    return await reply(f"usage: `/{cmd} <bot> <#1,3 | @grp|id|substr>`\n"
+                                       f"nomor `#n` ngikutin `/listgroups <bot>` terakhir")
                 bots = find_bots(args[0])
                 if not bots:
                     return await reply("no such bot")
                 b = bots[0]
-                entry = " ".join(args[1:])
-                try:
-                    entry_val = int(entry) if entry.lstrip("-").isdigit() else entry
-                except Exception:
-                    entry_val = entry
+                rest = args[1:]
+
+                if is_index_arg(rest):
+                    if not b.listing["group"]:
+                        return await reply(f"jalanin `/listgroups {b.name}` dulu biar ada nomornya")
+                    picked, bad = parse_indices(rest, b.listing["group"])
+                    if bad:
+                        return await reply(f"nomor nggak valid: {', '.join(bad)}")
+                    entry_vals = [d.id for d in picked]     # id = paling stabil
+                else:
+                    entry = " ".join(rest)
+                    entry_vals = [int(entry) if entry.lstrip("-").isdigit() else entry]
+
                 fil = b.cfg.setdefault("send_filter", {})
                 al = fil.setdefault("allowlist", [])
-                if cmd == "allow":
-                    if entry_val not in al:
-                        al.append(entry_val)
-                else:
-                    fil["allowlist"] = [x for x in al if str(x) != str(entry_val)]
+                for entry_val in entry_vals:
+                    if cmd == "allow":
+                        if entry_val not in al:
+                            al.append(entry_val)
+                    else:
+                        al[:] = [x for x in al if str(x) != str(entry_val)]
                 await b.refresh_targets()
                 save_fleet()
                 mode = fil.get("mode", "allowlist")
@@ -542,41 +877,16 @@ async def list_groups(session):
 # ---------------------------------------------------------------- boot
 
 async def main():
-    # start each userbot
+    # start each userbot listed in fleet.json (more can be added live via /addnumber)
     for cfg in USERBOT_CFGS:
-        b = Userbot(cfg)
-        b.client = TelegramClient(str(BASE / cfg["session"]), API_ID, API_HASH)
-        await b.client.start()  # interactive first run per session
-        me = await b.client.get_me()
-        log.info(f"[{b.name}] logged in as {me.first_name} (@{me.username})")
-        await b.refresh_sources()
-        await b.refresh_targets()
+        client = TelegramClient(str(BASE / cfg["session"]), API_ID, API_HASH)
+        await client.start()  # interactive first run per session
+        me = await client.get_me()
+        log.info(f"[{cfg['name']}] logged in as {me.first_name} (@{me.username})")
+        b = await attach_userbot(cfg, client)
         log.info(f"[{b.name}] {len(b.source_ids)} sources -> {len(b.targets)} groups "
                  f"(mode={cfg.get('send_filter',{}).get('mode')} "
                  f"dry={cfg.get('send_filter',{}).get('dry_run')})")
-
-        def make_handler(bot):
-            async def handler(event):
-                try:
-                    pid = utils.get_peer_id(await event.get_chat())
-                    if pid not in bot.source_ids:
-                        return
-                    src = bot.source_names.get(pid, "unknown")
-                    for ca, chain in extract_cas(get_all_text(event.message), bot.cfg.get("chains", ["sol", "evm"])):
-                        # inflight = queued by an earlier message, not committed yet
-                        if ca in bot.inflight or already_posted(bot.name, ca, bot.cfg.get("dedup_hours", 0)):
-                            bot.counters["dup_skips"] += 1
-                            continue
-                        bot.inflight.add(ca)
-                        log.info(f"[{bot.name}] NEW {chain.upper()} {ca} from {src} -> queue")
-                        await bot.queue.put((ca, chain, src))
-                except Exception as e:
-                    log.error(f"[{bot.name}] handler error: {e}")
-            return handler
-
-        b.client.add_event_handler(make_handler(b), events.NewMessage())
-        asyncio.create_task(sender_loop(b))
-        FLEET.append(b)
 
     # start control bot
     control = None
@@ -586,17 +896,24 @@ async def main():
         me = await control.get_me()
         log.info(f"control bot live: @{me.username} (admins: {sorted(ADMIN_IDS)})")
     else:
-        log.warning("No CONTROL_BOT_TOKEN — running without control bot")
+        log.warning("No CONTROL_BOT_TOKEN — running without control bot; /addnumber unavailable")
 
     log.info(f"CALLRELAY MANAGER up — {len(FLEET)} userbots")
-    clients = [b.client for b in FLEET] + ([control] if control else [])
-    await asyncio.gather(*[c.run_until_disconnected() for c in clients])
+    runners = [b.runner for b in FLEET]
+    if control:
+        runners.append(asyncio.create_task(control.run_until_disconnected()))
+    await asyncio.gather(*runners)
 
 
 if __name__ == "__main__":
     if "--list-groups" in sys.argv:
         idx = sys.argv.index("--list-groups")
-        session = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else USERBOT_CFGS[0]["session"]
+        if len(sys.argv) > idx + 1:
+            session = sys.argv[idx + 1]
+        elif USERBOT_CFGS:
+            session = USERBOT_CFGS[0]["session"]
+        else:
+            raise SystemExit("no userbot in fleet.json — usage: --list-groups <session>")
         asyncio.run(list_groups(session))
     else:
         asyncio.run(main())
