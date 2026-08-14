@@ -95,6 +95,8 @@ send_filter sama persis kayak versi sebelumnya (allowlist default, entry bisa id
 - Target group di-resolve pas start / `/reload` / edit allowlist. Join group baru pas jalan → `/reload <bot>`.
 - Semua userbot + control bot 1 proses. Proses mati = semua mati (PM2 auto-restart). Mau isolasi per-userbot → Redis pub/sub (v2).
 - Counter lifetime (reset pas restart), belum per-hari.
+- Dedup ditulis **setelah** CA kekirim minimal ke 1 group. Kalau semua send gagal / lagi `/pause`, CA-nya nggak dicatet → bakal di-relay lagi pas muncul berikutnya. Dry-run cuma preview, nggak nyentuh dedup db (jadi habis `/dryrun off`, CA yang tadi ke-preview masih bisa kekirim beneran).
+- `/allow` pas bot lagi mode `blocklist`/`all` → allowlist tetep ke-save tapi belum ngefek; control bot bakal ngewanti-wanti + kasih perintah `/mode <bot> allowlist`.
 - Edited message di-skip. Wallet-vs-CA belum dibedain (butuh DexScreener check, v2).
 
 ## v2

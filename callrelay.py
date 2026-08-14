@@ -240,32 +240,56 @@ async def resolve_targets(client):
 # ---------------------------------------------------------------- sender
 
 queue: asyncio.Queue = asyncio.Queue()
+inflight: set = set()   # CAs queued but not yet committed to the dedup db
 
 
 async def sender_loop(client, targets):
+    """Fan one CA out to every target group.
+
+    The CA is only committed to the dedup db once it actually reached at least
+    one group — a failed fanout leaves it un-marked so the next sighting is
+    relayed instead of silently swallowed. Dry runs never touch the db.
+    """
     while True:
         ca, chain, source = await queue.get()
-        text = build_message(ca, chain, source)
-        for d in targets:
-            if DRY_RUN:
-                log.info(f"[DRY] would send {ca[:10]}… -> {dialog_name(d)}")
-                continue
-            try:
-                await client.send_message(d.entity, text, parse_mode="md", link_preview=False)
-                log.info(f"sent {ca[:10]}… -> {dialog_name(d)}")
-            except FloodWaitError as e:
-                log.warning(f"floodwait {e.seconds}s (Telegram throttling the account)")
-                await asyncio.sleep(e.seconds + 2)
+        try:
+            text = build_message(ca, chain, source)
+            delivered = 0
+            for d in targets:
+                if DRY_RUN:
+                    log.info(f"[DRY] would send {ca[:10]}… -> {dialog_name(d)}")
+                    continue
                 try:
                     await client.send_message(d.entity, text, parse_mode="md", link_preview=False)
-                    log.info(f"sent (retry) {ca[:10]}… -> {dialog_name(d)}")
-                except Exception as e2:
-                    log.error(f"retry failed {dialog_name(d)}: {e2}")
-            except ChatWriteForbiddenError:
-                log.error(f"no write permission in {dialog_name(d)} — skipping")
-            except Exception as e:
-                log.error(f"send failed {dialog_name(d)}: {e}")
-            await asyncio.sleep(SEND_DELAY)
+                    delivered += 1
+                    log.info(f"sent {ca[:10]}… -> {dialog_name(d)}")
+                except FloodWaitError as e:
+                    log.warning(f"floodwait {e.seconds}s (Telegram throttling the account)")
+                    await asyncio.sleep(e.seconds + 2)
+                    try:
+                        await client.send_message(d.entity, text, parse_mode="md", link_preview=False)
+                        delivered += 1
+                        log.info(f"sent (retry) {ca[:10]}… -> {dialog_name(d)}")
+                    except Exception as e2:
+                        log.error(f"retry failed {dialog_name(d)}: {e2}")
+                except ChatWriteForbiddenError:
+                    log.error(f"no write permission in {dialog_name(d)} — skipping")
+                except Exception as e:
+                    log.error(f"send failed {dialog_name(d)}: {e}")
+                await asyncio.sleep(SEND_DELAY)
+
+            if DRY_RUN:
+                log.info(f"[DRY] {ca[:10]}… previewed — dedup db untouched")
+            elif delivered:
+                mark_posted(ca, chain, source)
+            else:
+                log.warning(f"{ca[:10]}… reached 0 groups — not recorded, "
+                            f"will relay again next time it shows up")
+        except Exception as e:
+            log.error(f"sender error on {ca[:10]}…: {e}")
+        finally:
+            inflight.discard(ca)
+            queue.task_done()
 
 
 # ---------------------------------------------------------------- --list-groups
@@ -327,16 +351,17 @@ async def main():
             chat = await event.get_chat()
             source_name = getattr(chat, "title", None) or getattr(chat, "username", "unknown")
             for ca, chain in extract_cas(get_all_text(event.message)):
-                if already_posted(ca):
+                # inflight = queued by an earlier message, not committed yet
+                if ca in inflight or already_posted(ca):
                     log.info(f"dup skip {ca[:10]}… (from {source_name})")
                     continue
-                mark_posted(ca, chain, source_name)
+                inflight.add(ca)
                 log.info(f"NEW {chain.upper()} CA {ca} from {source_name} -> queue")
                 await queue.put((ca, chain, source_name))
         except Exception as e:
             log.error(f"handler error: {e}")
 
-    asyncio.get_event_loop().create_task(sender_loop(client, targets))
+    asyncio.create_task(sender_loop(client, targets))
     log.info(f"CALLRELAY running — {len(resolved_sources)} sources -> {len(targets)} groups"
              + ("  [DRY RUN]" if DRY_RUN else ""))
     await client.run_until_disconnected()

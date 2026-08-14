@@ -239,6 +239,7 @@ class Userbot:
         self.targets = []
         self.source_ids = set()           # marked ids
         self.source_names = {}            # id -> title
+        self.inflight = set()             # CAs queued but not yet committed to the dedup db
         self.paused = False
         self.counters = {"relayed": 0, "dup_skips": 0, "sends_ok": 0, "sends_fail": 0}
 
@@ -271,39 +272,63 @@ def find_bots(selector):
 # ---------------------------------------------------------------- sender loop
 
 async def sender_loop(bot: Userbot):
+    """Fan one CA out to every target group.
+
+    The CA is only committed to the dedup db once it actually reached at least
+    one group — a paused/failed fanout leaves it un-marked so the next sighting
+    is relayed instead of silently swallowed. Dry runs never touch the db.
+    """
     while True:
         ca, chain, source = await bot.queue.get()
-        cfg = bot.cfg
-        dry = cfg.get("send_filter", {}).get("dry_run", False)
-        delay = cfg.get("delay_between_groups_sec", 5)
-        text = build_message(cfg, ca, chain, source)
-        for d in bot.targets:
-            if bot.paused:
-                log.info(f"[{bot.name}] paused — dropping remainder of {ca[:10]}…")
-                break
-            if dry:
-                log.info(f"[{bot.name}][DRY] would send {ca[:10]}… -> {dialog_name(d)}")
-                continue
-            try:
-                await bot.client.send_message(d.entity, text, parse_mode="md", link_preview=False)
-                bot.counters["sends_ok"] += 1
-                log.info(f"[{bot.name}] sent {ca[:10]}… -> {dialog_name(d)}")
-            except FloodWaitError as e:
-                log.warning(f"[{bot.name}] floodwait {e.seconds}s")
-                await asyncio.sleep(e.seconds + 2)
+        try:
+            cfg = bot.cfg
+            dry = cfg.get("send_filter", {}).get("dry_run", False)
+            delay = cfg.get("delay_between_groups_sec", 5)
+            text = build_message(cfg, ca, chain, source)
+            delivered = 0
+            for d in bot.targets:
+                if bot.paused:
+                    log.info(f"[{bot.name}] paused — dropping remainder of {ca[:10]}…")
+                    break
+                if dry:
+                    log.info(f"[{bot.name}][DRY] would send {ca[:10]}… -> {dialog_name(d)}")
+                    continue
                 try:
                     await bot.client.send_message(d.entity, text, parse_mode="md", link_preview=False)
                     bot.counters["sends_ok"] += 1
-                except Exception as e2:
+                    delivered += 1
+                    log.info(f"[{bot.name}] sent {ca[:10]}… -> {dialog_name(d)}")
+                except FloodWaitError as e:
+                    log.warning(f"[{bot.name}] floodwait {e.seconds}s")
+                    await asyncio.sleep(e.seconds + 2)
+                    try:
+                        await bot.client.send_message(d.entity, text, parse_mode="md", link_preview=False)
+                        bot.counters["sends_ok"] += 1
+                        delivered += 1
+                    except Exception as e2:
+                        bot.counters["sends_fail"] += 1
+                        log.error(f"[{bot.name}] retry failed {dialog_name(d)}: {e2}")
+                except ChatWriteForbiddenError:
                     bot.counters["sends_fail"] += 1
-                    log.error(f"[{bot.name}] retry failed {dialog_name(d)}: {e2}")
-            except ChatWriteForbiddenError:
-                bot.counters["sends_fail"] += 1
-                log.error(f"[{bot.name}] no write perm in {dialog_name(d)} — skip")
-            except Exception as e:
-                bot.counters["sends_fail"] += 1
-                log.error(f"[{bot.name}] send failed {dialog_name(d)}: {e}")
-            await asyncio.sleep(delay)
+                    log.error(f"[{bot.name}] no write perm in {dialog_name(d)} — skip")
+                except Exception as e:
+                    bot.counters["sends_fail"] += 1
+                    log.error(f"[{bot.name}] send failed {dialog_name(d)}: {e}")
+                await asyncio.sleep(delay)
+
+            if dry:
+                log.info(f"[{bot.name}][DRY] {ca[:10]}… previewed — dedup db untouched")
+            elif delivered:
+                mark_posted(bot.name, ca, chain, source)
+                bot.counters["relayed"] += 1
+            else:
+                log.warning(f"[{bot.name}] {ca[:10]}… reached 0 groups — not recorded, "
+                            f"will relay again next time it shows up")
+        except Exception as e:
+            log.error(f"[{bot.name}] sender error on {ca[:10]}…: {e}")
+        finally:
+            bot.inflight.discard(ca)
+            bot.queue.task_done()
 
 
 # ---------------------------------------------------------------- control bot
@@ -451,7 +476,14 @@ def register_control(control):
                     fil["allowlist"] = [x for x in al if str(x) != str(entry_val)]
                 await b.refresh_targets()
                 save_fleet()
-                await reply(f"`{b.name}` allowlist updated → {len(b.targets)} groups match")
+                mode = fil.get("mode", "allowlist")
+                note = "" if mode == "allowlist" else (
+                    f"\n⚠️ `{b.name}` is in `{mode}` mode — the allowlist is saved but not "
+                    f"filtering anything. Switch with `/mode {b.name} allowlist`."
+                )
+                await reply(f"`{b.name}` allowlist updated "
+                            f"({len(fil.get('allowlist', []))} entries) → "
+                            f"{len(b.targets)} groups match" + note)
 
             elif cmd == "groups":
                 bots = find_bots(args[0]) if args else []
@@ -525,16 +557,17 @@ async def main():
 
         def make_handler(bot):
             async def handler(event):
-                if utils.get_peer_id(await event.get_chat()) not in bot.source_ids:
-                    return
                 try:
-                    src = bot.source_names.get(utils.get_peer_id(await event.get_chat()), "unknown")
+                    pid = utils.get_peer_id(await event.get_chat())
+                    if pid not in bot.source_ids:
+                        return
+                    src = bot.source_names.get(pid, "unknown")
                     for ca, chain in extract_cas(get_all_text(event.message), bot.cfg.get("chains", ["sol", "evm"])):
-                        if already_posted(bot.name, ca, bot.cfg.get("dedup_hours", 0)):
+                        # inflight = queued by an earlier message, not committed yet
+                        if ca in bot.inflight or already_posted(bot.name, ca, bot.cfg.get("dedup_hours", 0)):
                             bot.counters["dup_skips"] += 1
                             continue
-                        mark_posted(bot.name, ca, chain, src)
-                        bot.counters["relayed"] += 1
+                        bot.inflight.add(ca)
                         log.info(f"[{bot.name}] NEW {chain.upper()} {ca} from {src} -> queue")
                         await bot.queue.put((ca, chain, src))
                 except Exception as e:
@@ -542,7 +575,7 @@ async def main():
             return handler
 
         b.client.add_event_handler(make_handler(b), events.NewMessage())
-        asyncio.get_event_loop().create_task(sender_loop(b))
+        asyncio.create_task(sender_loop(b))
         FLEET.append(b)
 
     # start control bot
