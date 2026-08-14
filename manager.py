@@ -46,9 +46,9 @@ from telethon.errors import (
 BASE = Path(__file__).parent
 load_dotenv(BASE / ".env")
 
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-CONTROL_BOT_TOKEN = os.getenv("CONTROL_BOT_TOKEN", "")
+API_ID_RAW = (os.getenv("API_ID") or "").strip()
+API_HASH = (os.getenv("API_HASH") or "").strip()
+CONTROL_BOT_TOKEN = (os.getenv("CONTROL_BOT_TOKEN") or "").strip()
 
 FLEET_PATH = BASE / "fleet.json"
 DB_PATH = BASE / "callrelay.db"
@@ -56,8 +56,22 @@ DB_PATH = BASE / "callrelay.db"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("manager")
 
-if not API_ID or not API_HASH:
-    raise SystemExit("Missing API_ID / API_HASH in .env — see HANDOFF.md")
+# Fail with one readable line instead of a traceback loop under pm2.
+GET_CREDS = ("Ambil api_id + api_hash di https://my.telegram.org "
+             "(login → API development tools), terus isi ke .env. Lihat HANDOFF.md")
+
+if not API_ID_RAW.isdigit():
+    raise SystemExit(
+        f"API_ID di .env bukan angka (isinya sekarang: {API_ID_RAW!r}). {GET_CREDS}"
+    )
+API_ID = int(API_ID_RAW)
+
+if not re.fullmatch(r"[0-9a-fA-F]{32}", API_HASH):
+    raise SystemExit(
+        f"API_HASH di .env bukan hash 32 karakter (isinya sekarang: {API_HASH!r}). {GET_CREDS}"
+    )
+if not CONTROL_BOT_TOKEN and not FLEET_PATH.exists():
+    raise SystemExit("CONTROL_BOT_TOKEN kosong dan fleet.json nggak ada — see HANDOFF.md")
 if not FLEET_PATH.exists():
     raise SystemExit("fleet.json not found — see HANDOFF.md")
 
