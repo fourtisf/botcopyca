@@ -81,7 +81,8 @@ Userbot baru selalu lahir **aman**: `dry_run: true`, 0 source, allowlist kosong 
 |---|---|
 | `/listchannels <bot> [keyword]` | Channel yang di-join akun itu, bernomor. `keyword` nyaring by judul/@username. ✅ = udah jadi source |
 | `/addsource <bot> <#1,3>` `/delsource <bot> <#1,3>` | Pilih/buang source pakai nomor dari listing barusan (`@channel` tetep bisa) |
-| `/listgroups <bot> [keyword]` | Group yang di-join, bernomor. ✅ = udah jadi target |
+| `/target <bot> <group\|channel\|both>` | Jenis chat yang boleh jadi target. Default `group`. Buat channel, akun userbot harus **admin dengan hak post** |
+| `/listgroups <bot> [keyword]` | Target yang di-join, bernomor — isinya ngikutin `/target`. ✅ = udah jadi target |
 | `/allow <bot> <#1,3>` `/unallow <bot> <#1,3>` | Pilih/buang target group pakai nomor (`@grp`/id/substring tetep bisa) |
 | `/titlefilter <bot> <kata\|clear>` | Saring target: cuma group yang judulnya ngandung kata itu |
 | `/groups <bot>` | Target yang kepilih sekarang (hasil akhir semua filter) |
@@ -96,6 +97,45 @@ Alur normalnya:
 /dryrun ub3 off            →  baru live
 ```
 Nomor `#n` ngikutin listing **terakhir** buat bot itu. Habis join/leave group baru, jalanin listing-nya lagi biar nomornya fresh.
+
+**Source channel nggak akan pernah jadi target.** Dia otomatis kefilter dari `/listgroups` dan dari daftar target — biar CA yang lo relay nggak masuk balik ke channel yang lagi lo pantau (echo).
+
+### Anti-spam
+
+| Command | Fungsi |
+|---|---|
+| `/batch <bot> <menit\|off>` | Kumpulin CA selama N menit → kirim **1 pesan recap**, bukan N pesan |
+| `/cap <bot> <n\|off>` | Max pesan per group per hari. Lewat itu, group-nya dilewatin |
+| `/quiet <bot> <23:00-07:00\|off>` | Jam tenang — nggak ngirim sama sekali di rentang itu |
+| `/delay <bot> <sec>` | Jeda antar group (default 5s, jangan diturunin) |
+
+**Kenapa `/batch` yang paling ngefek.** `delay` cuma ngatur kecepatan kirim per akun (buat ngehindarin floodwait). Yang bikin group lo kerasa spam itu **berapa sering group itu dikirimin**. Kalau source lagi rame, 10 call dalam 2 menit = 10 notif. Dengan `/batch ub1 10`, sepuluh-duanya jadi satu pesan:
+
+```
+📊 CALL RECAP — 4 CA / 10m
+
+1. `7xKX...`
+SOL · Alpha Calls — GMGN | DexScreener | Photon
+
+2. `0x91a...`
+EVM · Beta Signals — DexScreener
+...
+🔍 DYOR | NFA
+```
+
+Detailnya:
+- Window mulai ngitung dari **CA pertama** yang masuk, bukan dari jam bulat.
+- Max 15 CA per pesan. Kalau kepenuhan sebelum window abis, langsung dikirim.
+- 1 CA doang → format `NEW CALL` biasa, bukan recap.
+- `batch_window_sec: 0` (default) = perilaku lama, kirim satuan.
+
+**Quiet hours** pakai jam server. Set dulu timezone VPS-nya:
+```bash
+timedatectl set-timezone Asia/Jakarta
+```
+CA yang masuk pas jam tenang **nggak dicatet di dedup db**, jadi kalau muncul lagi besoknya tetep kekirim.
+
+**Cap harian** kehitung per group per hari, kesimpen di `callrelay.db` — jadi restart nggak nge-reset.
 
 ### Operasi harian
 
@@ -123,7 +163,11 @@ userbots[]     : tiap userbot:
   session                     : nama file session (login akun ini)
   source_channels             : channel di-monitor
   chains / dedup_hours / delay_between_groups_sec / attribution / template
-  send_filter                 : mode / allowlist / blocklist / title_contains / include_channels / dry_run
+  batch_window_sec            : 0 = off, >0 = kumpulin CA sekian detik jadi 1 recap
+  max_per_day_per_group       : 0 = unlimited
+  quiet_hours                 : null atau "23:00-07:00" (jam server)
+  send_filter                 : mode / allowlist / blocklist / title_contains /
+                                include_groups / include_channels / dry_run
 ```
 
 send_filter sama persis kayak versi sebelumnya (allowlist default, entry bisa id / @username / substring judul, dry_run buat preview).

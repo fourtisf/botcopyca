@@ -106,6 +106,71 @@ def mark_posted(bot, ca, chain, source):
     db.commit()
 
 
+# ---------------------------------------------------------------- per-group daily cap
+
+db.execute(
+    """CREATE TABLE IF NOT EXISTS sends (
+        bot TEXT, gid INTEGER, day TEXT, count INTEGER,
+        PRIMARY KEY (bot, gid, day)
+    )"""
+)
+db.commit()
+
+
+def today_str():
+    """Local date — set the VPS clock with: timedatectl set-timezone Asia/Jakarta"""
+    return time.strftime("%Y-%m-%d")
+
+
+def sends_today(bot: str, gid: int) -> int:
+    row = db.execute("SELECT count FROM sends WHERE bot=? AND gid=? AND day=?",
+                     (bot, gid, today_str())).fetchone()
+    return row[0] if row else 0
+
+
+def bump_send(bot: str, gid: int):
+    db.execute(
+        "INSERT INTO sends (bot, gid, day, count) VALUES (?,?,?,1) "
+        "ON CONFLICT(bot, gid, day) DO UPDATE SET count = count + 1",
+        (bot, gid, today_str()),
+    )
+    db.commit()
+
+
+def cap_reached(cfg, gid: int) -> bool:
+    cap = cfg.get("max_per_day_per_group", 0) or 0
+    return cap > 0 and sends_today(cfg["name"], gid) >= cap
+
+
+# ---------------------------------------------------------------- quiet hours
+
+QUIET_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)-([01]?\d|2[0-3]):([0-5]\d)$")
+
+
+def parse_quiet(s):
+    """'23:00-07:00' -> (1380, 420) in minutes-since-midnight, or None."""
+    m = QUIET_RE.match((s or "").strip())
+    if not m:
+        return None
+    h1, m1, h2, m2 = (int(x) for x in m.groups())
+    return h1 * 60 + m1, h2 * 60 + m2
+
+
+def in_quiet_hours(cfg, now_minutes=None) -> bool:
+    rng = parse_quiet(cfg.get("quiet_hours"))
+    if not rng:
+        return False
+    start, end = rng
+    if now_minutes is None:
+        lt = time.localtime()
+        now_minutes = lt.tm_hour * 60 + lt.tm_min
+    if start == end:
+        return False
+    if start < end:                       # 09:00-17:00
+        return start <= now_minutes < end
+    return now_minutes >= start or now_minutes < end   # 23:00-07:00, lewat tengah malam
+
+
 # ---------------------------------------------------------------- CA extraction / format
 
 EVM_RE = re.compile(r"\b0x[a-fA-F0-9]{40}\b")
@@ -161,20 +226,39 @@ DEFAULT_TEMPLATE = (
 )
 
 
-def build_message(cfg, ca, chain, source_name):
+def ca_links(ca, chain):
     if chain == "sol":
-        links = (
+        return (
             f"[GMGN](https://gmgn.ai/sol/token/{ca}) | "
             f"[DexScreener](https://dexscreener.com/solana/{ca}) | "
             f"[Photon](https://photon-sol.tinyastro.io/en/lp/{ca})"
-        )
-        label = "SOL"
-    else:
-        links = f"[DexScreener](https://dexscreener.com/search?q={ca})"
-        label = "EVM"
+        ), "SOL"
+    return f"[DexScreener](https://dexscreener.com/search?q={ca})", "EVM"
+
+
+def build_message(cfg, ca, chain, source_name):
+    links, label = ca_links(ca, chain)
     src = f"📡 Source: {source_name}" if cfg.get("attribution", True) else ""
     tpl = cfg.get("template") or DEFAULT_TEMPLATE
     return tpl.format(ca=ca, chain=label, links=links, source=src).strip()
+
+
+def build_digest(cfg, items):
+    """One message for a whole batch — the anti-spam format."""
+    if len(items) == 1:
+        ca, chain, source = items[0]
+        return build_message(cfg, ca, chain, source)
+    attrib = cfg.get("attribution", True)
+    window_min = max(1, round(cfg.get("batch_window_sec", 0) / 60))
+    lines = [f"📊 **CALL RECAP** — {len(items)} CA / {window_min}m", ""]
+    for i, (ca, chain, source) in enumerate(items, start=1):
+        links, label = ca_links(ca, chain)
+        tail = f" · {source}" if attrib else ""
+        lines.append(f"**{i}.** `{ca}`")
+        lines.append(f"{label}{tail} — {links}")
+        lines.append("")
+    lines.append("🔍 DYOR | NFA")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- filter
@@ -206,22 +290,31 @@ def dialog_matches(d, entry):
     return s.lower() in title.lower()
 
 
-async def resolve_targets(client, cfg):
+def target_kind_ok(d, fil):
+    """send_filter decides which dialog kinds can be targets at all."""
+    is_broadcast = d.is_channel and not d.is_group
+    if is_broadcast:
+        return fil.get("include_channels", False)
+    if d.is_group:
+        return fil.get("include_groups", True)
+    return False
+
+
+async def resolve_targets(client, cfg, source_ids=()):
     fil = cfg.get("send_filter", {})
     mode = fil.get("mode", "allowlist")
     allow = fil.get("allowlist", [])
     block = fil.get("blocklist", [])
     title_contains = fil.get("title_contains", [])
-    include_channels = fil.get("include_channels", False)
 
     out = []
     for d in await client.get_dialogs():
         if d.is_user:
             continue
-        is_broadcast = d.is_channel and not d.is_group
-        if is_broadcast and not include_channels:
+        if not target_kind_ok(d, fil):
             continue
-        if not (d.is_group or (is_broadcast and include_channels)):
+        if d.id in source_ids:
+            # never post back into a channel we are listening to — that echoes
             continue
         if title_contains:
             t = getattr(d.entity, "title", "") or ""
@@ -273,7 +366,7 @@ class Userbot:
                 log.error(f"[{self.name}] cannot resolve source {s}: {e}")
 
     async def refresh_targets(self):
-        self.targets = await resolve_targets(self.client, self.cfg)
+        self.targets = await resolve_targets(self.client, self.cfg, self.source_ids)
 
 
 FLEET = []  # list[Userbot]
@@ -288,11 +381,18 @@ def find_bots(selector):
 
 # ---------------------------------------------------------------- dialog pickers
 
-MAX_LIST = 40   # keep a listing under Telegram's 4096-char message cap
+MAX_LIST = 40    # keep a listing under Telegram's 4096-char message cap
+MAX_BATCH = 15   # hard ceiling on CAs per digest, so one message stays readable
 
 
 async def collect_dialogs(bot, kind, keyword=None):
-    """Joined dialogs of one kind ('channel' = broadcast, 'group'), title/@name filtered."""
+    """Joined dialogs to pick from, title/@name filtered.
+
+    kind='channel' -> every broadcast channel (source candidates)
+    kind='group'   -> whatever send_filter allows as a target right now
+                      (groups, channels, or both — see /target), sources excluded
+    """
+    fil = bot.cfg.get("send_filter", {})
     out = []
     for d in await bot.client.get_dialogs():
         if d.is_user:
@@ -300,8 +400,9 @@ async def collect_dialogs(bot, kind, keyword=None):
         is_broadcast = d.is_channel and not d.is_group
         if kind == "channel" and not is_broadcast:
             continue
-        if kind == "group" and not d.is_group:
-            continue
+        if kind == "group":
+            if not target_kind_ok(d, fil) or d.id in bot.source_ids:
+                continue
         if keyword:
             k = keyword.lower()
             title = (getattr(d.entity, "title", "") or "").lower()
@@ -358,11 +459,15 @@ def new_bot_cfg(name, session):
         "delay_between_groups_sec": 5,
         "attribution": True,
         "template": None,
+        "batch_window_sec": 0,
+        "max_per_day_per_group": 0,
+        "quiet_hours": None,
         "send_filter": {
             "mode": "allowlist",
             "allowlist": [],
             "blocklist": [],
             "title_contains": [],
+            "include_groups": True,
             "include_channels": False,
             "dry_run": True,
         },
@@ -428,56 +533,85 @@ async def sender_loop(bot: Userbot):
     is relayed instead of silently swallowed. Dry runs never touch the db.
     """
     while True:
-        ca, chain, source = await bot.queue.get()
+        items = [await bot.queue.get()]
         try:
             cfg = bot.cfg
+            window = cfg.get("batch_window_sec", 0) or 0
+            if window > 0:
+                # hold the line open: collect whatever else lands inside the window,
+                # so a burst of calls becomes ONE digest instead of N messages
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + window
+                while len(items) < MAX_BATCH:
+                    left = deadline - loop.time()
+                    if left <= 0:
+                        break
+                    try:
+                        items.append(await asyncio.wait_for(bot.queue.get(), timeout=left))
+                    except asyncio.TimeoutError:
+                        break
+                log.info(f"[{bot.name}] batch window closed — {len(items)} CA")
+
             dry = cfg.get("send_filter", {}).get("dry_run", False)
             delay = cfg.get("delay_between_groups_sec", 5)
-            text = build_message(cfg, ca, chain, source)
+            text = build_digest(cfg, items)
+            label = f"{len(items)} CA" if len(items) > 1 else f"{items[0][0][:10]}…"
             delivered = 0
-            for d in bot.targets:
-                if bot.paused:
-                    log.info(f"[{bot.name}] paused — dropping remainder of {ca[:10]}…")
-                    break
-                if dry:
-                    log.info(f"[{bot.name}][DRY] would send {ca[:10]}… -> {dialog_name(d)}")
-                    continue
-                try:
-                    await bot.client.send_message(d.entity, text, parse_mode="md", link_preview=False)
-                    bot.counters["sends_ok"] += 1
-                    delivered += 1
-                    log.info(f"[{bot.name}] sent {ca[:10]}… -> {dialog_name(d)}")
-                except FloodWaitError as e:
-                    log.warning(f"[{bot.name}] floodwait {e.seconds}s")
-                    await asyncio.sleep(e.seconds + 2)
+            quiet = in_quiet_hours(cfg)
+
+            if quiet:
+                log.info(f"[{bot.name}] quiet hours {cfg.get('quiet_hours')} — holding {label}")
+            else:
+                for d in bot.targets:
+                    if bot.paused:
+                        log.info(f"[{bot.name}] paused — dropping remainder of {label}")
+                        break
+                    if cap_reached(cfg, d.id):
+                        log.info(f"[{bot.name}] daily cap reached for {dialog_name(d)} — skip")
+                        continue
+                    if dry:
+                        log.info(f"[{bot.name}][DRY] would send {label} -> {dialog_name(d)}")
+                        continue
                     try:
                         await bot.client.send_message(d.entity, text, parse_mode="md", link_preview=False)
                         bot.counters["sends_ok"] += 1
                         delivered += 1
-                    except Exception as e2:
+                        bump_send(bot.name, d.id)
+                        log.info(f"[{bot.name}] sent {label} -> {dialog_name(d)}")
+                    except FloodWaitError as e:
+                        log.warning(f"[{bot.name}] floodwait {e.seconds}s")
+                        await asyncio.sleep(e.seconds + 2)
+                        try:
+                            await bot.client.send_message(d.entity, text, parse_mode="md", link_preview=False)
+                            bot.counters["sends_ok"] += 1
+                            delivered += 1
+                            bump_send(bot.name, d.id)
+                        except Exception as e2:
+                            bot.counters["sends_fail"] += 1
+                            log.error(f"[{bot.name}] retry failed {dialog_name(d)}: {e2}")
+                    except ChatWriteForbiddenError:
                         bot.counters["sends_fail"] += 1
-                        log.error(f"[{bot.name}] retry failed {dialog_name(d)}: {e2}")
-                except ChatWriteForbiddenError:
-                    bot.counters["sends_fail"] += 1
-                    log.error(f"[{bot.name}] no write perm in {dialog_name(d)} — skip")
-                except Exception as e:
-                    bot.counters["sends_fail"] += 1
-                    log.error(f"[{bot.name}] send failed {dialog_name(d)}: {e}")
-                await asyncio.sleep(delay)
+                        log.error(f"[{bot.name}] no write perm in {dialog_name(d)} — skip")
+                    except Exception as e:
+                        bot.counters["sends_fail"] += 1
+                        log.error(f"[{bot.name}] send failed {dialog_name(d)}: {e}")
+                    await asyncio.sleep(delay)
 
-            if dry:
-                log.info(f"[{bot.name}][DRY] {ca[:10]}… previewed — dedup db untouched")
+            if dry and not quiet:
+                log.info(f"[{bot.name}][DRY] {label} previewed — dedup db untouched")
             elif delivered:
-                mark_posted(bot.name, ca, chain, source)
-                bot.counters["relayed"] += 1
+                for ca, chain, source in items:
+                    mark_posted(bot.name, ca, chain, source)
+                bot.counters["relayed"] += len(items)
             else:
-                log.warning(f"[{bot.name}] {ca[:10]}… reached 0 groups — not recorded, "
+                log.warning(f"[{bot.name}] {label} reached 0 groups — not recorded, "
                             f"will relay again next time it shows up")
         except Exception as e:
-            log.error(f"[{bot.name}] sender error on {ca[:10]}…: {e}")
+            log.error(f"[{bot.name}] sender error: {e}")
         finally:
-            bot.inflight.discard(ca)
-            bot.queue.task_done()
+            for ca, _, _ in items:
+                bot.inflight.discard(ca)
+                bot.queue.task_done()
 
 
 # ---------------------------------------------------------------- control bot
@@ -492,16 +626,22 @@ HELP = (
     "`/listchannels <bot> [keyword]` — channel yang di-join, bernomor\n"
     "`/addsource <bot> <#1,3 | @ch>` · `/delsource <bot> <#1,3 | @ch>`\n"
     "`/sources <bot>`\n\n"
-    "**Pilih target group**\n"
-    "`/listgroups <bot> [keyword]` — group yang di-join, bernomor\n"
+    "**Pilih target group/channel**\n"
+    "`/target <bot> <group|channel|both>` — jenis chat yang boleh jadi target\n"
+    "`/listgroups <bot> [keyword]` — target yang di-join, bernomor\n"
     "`/allow <bot> <#1,3 | @grp|id|substr>` · `/unallow <bot> <#1,3 | entry>`\n"
     "`/mode <bot> <allowlist|blocklist|all>`\n"
-    "`/titlefilter <bot> <kata|clear>` — saring group by judul\n"
+    "`/titlefilter <bot> <kata|clear>` — saring by judul\n"
     "`/groups <bot>` — target yang kepilih sekarang\n\n"
+    "**Anti-spam**\n"
+    "`/batch <bot> <menit|off>` — kumpulin CA → 1 pesan recap\n"
+    "`/cap <bot> <n|off>` — max pesan per group per hari\n"
+    "`/quiet <bot> <23:00-07:00|off>` — jam tenang\n"
+    "`/delay <bot> <sec>` — jeda antar group\n\n"
     "**Operasi**\n"
     "`/status` · `/stats <bot|all>`\n"
     "`/pause <bot|all>` · `/resume <bot|all>`\n"
-    "`/dryrun <bot|all> <on|off>` · `/delay <bot> <sec>`\n"
+    "`/dryrun <bot|all> <on|off>`\n"
     "`/reload <bot|all>` — re-resolve habis join/leave\n"
 )
 
@@ -660,6 +800,86 @@ def register_control(control):
                         else f"`/allow {b.name} #1,3`")
                 await reply(head + "\n".join(render_listing(dialogs, chosen)) + f"\n\npilih: {pick}")
 
+            # ---------------------------------------------------- anti-spam knobs
+            elif cmd == "batch":
+                if len(args) < 2:
+                    return await reply("usage: `/batch <bot> <menit|off>`\n"
+                                       "kumpulin CA selama N menit → kirim 1 pesan recap")
+                bots = find_bots(args[0])
+                if not bots:
+                    return await reply("no such bot")
+                val = args[1].lower()
+                if val in ("off", "0"):
+                    secs = 0
+                else:
+                    try:
+                        secs = int(round(float(val) * 60))
+                    except ValueError:
+                        return await reply("menitnya angka ya, contoh `/batch ub1 10`")
+                    if secs < 60:
+                        return await reply("minimal 1 menit")
+                for b in bots:
+                    b.cfg["batch_window_sec"] = secs
+                save_fleet()
+                await reply(f"`{bots[0].name}` batch = "
+                            + ("off (kirim satuan)" if not secs else f"{secs // 60} menit / max {MAX_BATCH} CA per pesan"))
+
+            elif cmd == "cap":
+                if len(args) < 2:
+                    return await reply("usage: `/cap <bot> <n|off>` — max pesan per group per hari")
+                bots = find_bots(args[0])
+                if not bots:
+                    return await reply("no such bot")
+                val = args[1].lower()
+                try:
+                    n = 0 if val in ("off", "0") else int(val)
+                except ValueError:
+                    return await reply("angkanya ya, contoh `/cap ub1 20`")
+                for b in bots:
+                    b.cfg["max_per_day_per_group"] = max(0, n)
+                save_fleet()
+                await reply(f"`{bots[0].name}` cap = " + ("off" if n <= 0 else f"{n} pesan/group/hari"))
+
+            elif cmd == "quiet":
+                if len(args) < 2:
+                    lt = time.strftime("%H:%M")
+                    return await reply(f"usage: `/quiet <bot> <HH:MM-HH:MM|off>`\n"
+                                       f"contoh `/quiet ub1 23:00-07:00`\n"
+                                       f"jam server sekarang: **{lt}**")
+                bots = find_bots(args[0])
+                if not bots:
+                    return await reply("no such bot")
+                val = args[1].lower()
+                if val == "off":
+                    rng = None
+                elif parse_quiet(args[1]):
+                    rng = args[1]
+                else:
+                    return await reply("format jamnya `HH:MM-HH:MM`, contoh `23:00-07:00`")
+                for b in bots:
+                    b.cfg["quiet_hours"] = rng
+                save_fleet()
+                now = "🌙 lagi jam tenang" if in_quiet_hours(bots[0].cfg) else "☀️ lagi jam aktif"
+                await reply(f"`{bots[0].name}` quiet hours = {rng or 'off'}\n"
+                            f"jam server **{time.strftime('%H:%M')}** — {now}")
+
+            elif cmd == "target":
+                if len(args) < 2 or args[1] not in ("group", "channel", "both"):
+                    return await reply("usage: `/target <bot> <group|channel|both>`\n"
+                                       "nentuin jenis chat yang boleh jadi target kiriman")
+                bots = find_bots(args[0])
+                if not bots:
+                    return await reply("no such bot")
+                b = bots[0]
+                fil = b.cfg.setdefault("send_filter", {})
+                fil["include_groups"] = args[1] in ("group", "both")
+                fil["include_channels"] = args[1] in ("channel", "both")
+                await b.refresh_targets()
+                save_fleet()
+                await reply(f"`{b.name}` target = `{args[1]}` → {len(b.targets)} chat\n"
+                            f"cek daftarnya: `/listgroups {b.name}`\n"
+                            f"_note: buat channel, akun userbot harus admin dengan hak post._")
+
             elif cmd == "titlefilter":
                 if len(args) < 2:
                     return await reply("usage: `/titlefilter <bot> <kata|clear>`")
@@ -680,14 +900,24 @@ def register_control(control):
                             f"→ {len(b.targets)} group")
 
             elif cmd == "status":
-                lines = ["**Fleet status**"]
+                lines = [f"**Fleet status** — jam server {time.strftime('%H:%M')}"]
                 for b in FLEET:
                     dry = b.cfg.get("send_filter", {}).get("dry_run", False)
                     state = "⏸ paused" if b.paused else ("🧪 dry" if dry else "▶️ live")
+                    if in_quiet_hours(b.cfg):
+                        state += " 🌙"
+                    knobs = []
+                    if b.cfg.get("batch_window_sec"):
+                        knobs.append(f"batch {b.cfg['batch_window_sec'] // 60}m")
+                    if b.cfg.get("max_per_day_per_group"):
+                        knobs.append(f"cap {b.cfg['max_per_day_per_group']}/hari")
+                    if b.cfg.get("quiet_hours"):
+                        knobs.append(f"quiet {b.cfg['quiet_hours']}")
                     lines.append(
                         f"• `{b.name}` {state} — {len(b.source_ids)} src → "
                         f"{len(b.targets)} grp | relayed {b.counters['relayed']} "
                         f"ok {b.counters['sends_ok']} fail {b.counters['sends_fail']}"
+                        + (f"\n   ⚙️ {' · '.join(knobs)}" if knobs else "")
                     )
                 await reply("\n".join(lines))
 
