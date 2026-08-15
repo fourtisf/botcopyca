@@ -93,7 +93,8 @@ Source channel otomatis dikecualiin dari daftar target, jadi nggak mungkin echo.
 | `/code <name> <kode>` | Masukin OTP. Angka doang yang dibaca, jadi boleh dipisah spasi |
 | `/pass <name> <password>` | Kalau akunnya pakai 2FA |
 | `/cancel <name>` | Batalin login yang lagi nunggu |
-| `/delbot <name>` | Copot userbot dari fleet (file session tetep di disk) |
+| `/delbot` | Daftar akun buat dihapus (tombol) |
+| `/delbot <name>` | Copot userbot dari fleet — nanya konfirmasi dulu; file session tetep di disk |
 
 Contoh:
 ```
@@ -106,6 +107,8 @@ Contoh:
 > ⚠️ **Telegram nge-invalidate kode login yang ditulis mentahan di chat Telegram.** Makanya `/code` nerima angka yang dipisah (`1 2 3 4 5`, `12-345`) — non-digit dibuang otomatis. Habis login, **hapus pesan kodenya**. Kalau kodenya kadung mati, ulang `/addnumber`.
 
 Userbot baru selalu lahir **aman**: `dry_run: true`, 0 source, allowlist kosong — jadi nggak bakal ngirim apa-apa sebelum lo isi sendiri.
+
+`/bots` nampilin tiap akun lengkap: label (`ub1`), **@username**, **nomor HP**, status, jumlah source & target. Identitas itu dibaca dari `get_me()` tiap kali proses start dan disimpen di `fleet.json -> userbots[].account`, jadi akun lama pun kebaca tanpa login ulang.
 
 ### Pilih source channel & target group (bernomor)
 

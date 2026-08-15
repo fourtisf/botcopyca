@@ -719,10 +719,52 @@ def make_handler(bot):
     return handler
 
 
+async def remember_account(b):
+    """Simpen identitas akunnya (nama, @username, nomor HP) ke config, biar
+    daftar userbot nunjukin akun beneran — bukan cuma label `ub1`."""
+    try:
+        me = await b.client.get_me()
+    except Exception as e:
+        log.warning(f"[{b.name}] nggak bisa baca identitas akun: {e}")
+        return
+    acc = {
+        "id": getattr(me, "id", None),
+        "name": " ".join(x for x in (getattr(me, "first_name", None),
+                                     getattr(me, "last_name", None)) if x) or None,
+        "username": getattr(me, "username", None),
+        "phone": getattr(me, "phone", None),
+    }
+    if acc.get("phone") and not str(acc["phone"]).startswith("+"):
+        acc["phone"] = "+" + str(acc["phone"])
+    b.cfg["account"] = {k: v for k, v in acc.items() if v}
+
+
+def account_line(b):
+    """Satu baris identitas: '@albertego · +6281234 · Albert'."""
+    acc = b.cfg.get("account") or {}
+    bits = []
+    if acc.get("username"):
+        bits.append("@" + acc["username"])
+    if acc.get("phone"):
+        bits.append(acc["phone"])
+    if acc.get("name") and acc.get("name") != acc.get("username"):
+        bits.append(acc["name"])
+    if getattr(b, "botmode", False):
+        return "relay lewat bot token (bukan akun HP)"
+    return " · ".join(bits) if bits else "_identitas belum kebaca_"
+
+
+def bot_state_icon(b):
+    if b.paused:
+        return "⏸"
+    return "🧪" if b.cfg.get("send_filter", {}).get("dry_run") else "▶️"
+
+
 async def attach_userbot(cfg, client):
     """Wire a logged-in client into the fleet: resolve, listen, start sending."""
     b = Userbot(cfg)
     b.client = client
+    await remember_account(b)
     await b.refresh_sources()
     await b.refresh_targets()
     client.add_event_handler(make_handler(b), events.NewMessage())
@@ -1350,10 +1392,22 @@ def register_control(control):
                         + ("tambah: `/addnumber ub1 +628...`" if CREDS_OK
                            else "⚠️ butuh `api_id` dulu sebelum bisa nambah akun"),
                         menu_main())
-                rows = [[(f"{'⏸' if b.paused else '🧪' if b.cfg.get('send_filter',{}).get('dry_run') else '▶️'} {b.name}",
-                          f"/bot {b.name}")] for b in FLEET]
+                lines = [f"**{len(FLEET)} userbot**", ""]
+                rows = []
+                for b in FLEET:
+                    live = "live" if not b.paused and not b.cfg.get("send_filter", {}).get("dry_run") \
+                           else ("paused" if b.paused else "dry-run")
+                    lines.append(f"{bot_state_icon(b)} **{b.name}** — {live}")
+                    lines.append(f"    {account_line(b)}")
+                    lines.append(f"    📡 {len(b.source_ids)} source · 🎯 {len(b.targets)} target")
+                    lines.append("")
+                    acc = b.cfg.get("account") or {}
+                    tag = f" ({'@' + acc['username'] if acc.get('username') else acc.get('phone', '')})" \
+                          if (acc.get("username") or acc.get("phone")) else ""
+                    rows.append([(f"{bot_state_icon(b)} {b.name}{tag}"[:60], f"/bot {b.name}")])
+                rows.append([("➕ Tambah akun", "/addnumber"), ("🗑 Hapus akun", "/delbot")])
                 rows.append([("⬅️ Menu", "/menu")])
-                await reply(f"**{len(FLEET)} userbot** — pilih buat ngatur:", rows)
+                await reply("\n".join(lines), rows)
 
             elif cmd == "bot":
                 bots = find_bots(args[0]) if args else []
@@ -1367,7 +1421,8 @@ def register_control(control):
                 n_grp = sum(1 for d in b.targets if d.is_group)
                 n_ch = len(b.targets) - n_grp
                 txt = (
-                    f"**{b.name}** — {state}\n\n"
+                    f"**{b.name}** — {state}\n"
+                    f"👤 {account_line(b)}\n\n"
                     f"📡 source: {len(b.source_ids)}\n"
                     f"🎯 target: {len(b.targets)}"
                     + (f" (👥 {n_grp} group · 📢 {n_ch} channel)" if n_ch else
@@ -1967,15 +2022,32 @@ def register_control(control):
                 await reply(f"login `{name}` dibatalin")
 
             elif cmd == "delbot":
-                bots = [b for b in FLEET if b.name == (args[0] if args else "")]
+                real = [b for b in FLEET if not getattr(b, "botmode", False)]
+                if not args:                       # tombol "Hapus akun" — pilih dulu
+                    if not real:
+                        return await reply("belum ada userbot yang bisa dihapus", menu_main())
+                    rows = [[(f"🗑 {b.name} — {account_line(b)}"[:60], f"/delbot {b.name}")]
+                            for b in real]
+                    rows.append([("⬅️ Balik", "/bots")])
+                    return await reply("**Hapus akun yang mana?**\n"
+                                       "_Nanti masih ada konfirmasi sekali lagi._", rows)
+                bots = [b for b in FLEET if b.name == args[0]]
                 if not bots:
                     return await reply("usage: `/delbot <name>` (nama persis, `all` nggak dipake di sini)")
                 b = bots[0]
+                if len(args) < 2 or args[1] != "yes":      # konfirmasi, biar nggak kepencet
+                    return await reply(
+                        f"⚠️ **Hapus `{b.name}`?**\n"
+                        f"{account_line(b)}\n"
+                        f"📡 {len(b.source_ids)} source · 🎯 {len(b.targets)} target bakal ikut ilang.\n\n"
+                        f"_File session-nya tetep di disk, jadi bisa dipasang lagi tanpa OTP ulang._",
+                        [[("🗑 Ya, hapus", f"/delbot {b.name} yes"), ("↩️ Batal", "/bots")]])
                 await detach_userbot(b)
                 save_fleet()
                 await reply(f"🗑 `{b.name}` dicopot dari fleet.\n"
                             f"file session `{b.cfg.get('session')}.session` masih ada di disk — "
-                            f"hapus manual kalau mau logout beneran.")
+                            f"hapus manual kalau mau logout beneran.",
+                            [[("🤖 Daftar userbot", "/bots")]])
 
             # ---------------------------------------------------- pickers
             elif cmd in ("listchannels", "listgroups"):
