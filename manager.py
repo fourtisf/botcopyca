@@ -609,6 +609,31 @@ async def detach_userbot(bot):
 
 PENDING_LOGINS = {}   # bot name -> {client, phone, hash, session}
 
+# Typing "/addnumber ub1 +62…" is a lot to ask. In a private chat with an admin,
+# a bare phone number starts the flow and bare digits answer the OTP prompt.
+PHONE_RE = re.compile(r"^\+\d[\d\s\-().]{6,20}$")
+
+
+def next_bot_name():
+    used = {b.name for b in FLEET} | set(PENDING_LOGINS)
+    i = 1
+    while f"ub{i}" in used:
+        i += 1
+    return f"ub{i}"
+
+
+def map_plain_text(raw):
+    """Plain message -> the command it stands for, or None to ignore."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if PHONE_RE.match(raw):
+        return "/addnumber " + re.sub(r"[^0-9+]", "", raw)
+    digits = re.sub(r"\D", "", raw)
+    if PENDING_LOGINS and re.fullmatch(r"[\d\s\-]{4,20}", raw) and 4 <= len(digits) <= 8:
+        return f"/code {list(PENDING_LOGINS)[-1]} {digits}"
+    return None
+
 
 # ---------------------------------------------------------------- bot-token relay (no api_id)
 
@@ -982,6 +1007,13 @@ def menu_bot(b):
     ]
 
 
+def is_private_chat(event):
+    chat = getattr(event, "chat", None)
+    if isinstance(chat, dict):                       # Bot API shape
+        return chat.get("type") == "private"
+    return bool(getattr(event, "is_private", True))  # Telethon
+
+
 def to_telethon_buttons(rows):
     if not rows or Button is None:
         return None
@@ -998,8 +1030,9 @@ HELP = (
     "**CALLRELAY control**\n"
     "_tap `/menu` buat versi tombol_\n\n"
     "**Akun**\n"
-    "`/addnumber <name> <+62...>` — tambah userbot baru (login OTP)\n"
-    "`/code <name> <kode>` · `/pass <name> <2fa>` · `/cancel <name>`\n"
+    "**Kirim nomornya aja** (`+628...`) buat nambah userbot — nggak usah command.\n"
+    "Terus balas kode OTP-nya, juga tanpa command.\n"
+    "`/addnumber <+62...>` · `/pass <2fa>` · `/cancel <name>`\n"
     "`/bots` — daftar userbot · `/bot <name>` — panel satu userbot\n"
     "`/delbot <name>` — copot userbot dari fleet\n\n"
     "**Pilih source channel**\n"
@@ -1049,11 +1082,18 @@ HELP = (
 
 
 def register_control(control):
-    @control.on(events.NewMessage(pattern=r"^/"))
+    @control.on(events.NewMessage())
     async def on_cmd(event):
         if event.sender_id not in ADMIN_IDS:
             return  # silently ignore non-admins
-        parts = (event.raw_text or "").split()
+        raw = (event.raw_text or "").strip()
+        if not raw.startswith("/"):
+            if not is_private_chat(event):
+                return                       # in groups only real commands count
+            raw = map_plain_text(raw)
+            if not raw:
+                return
+        parts = raw.split()
         if not parts:
             return
         cmd = parts[0].lower().lstrip("/").split("@")[0]   # /status@mybot -> status
@@ -1589,9 +1629,18 @@ def register_control(control):
                         "(*API development tools*), isi ke `.env`, terus `pm2 restart callrelay`.",
                         [[("📋 Lihat chat", "/chats")]]
                     )
-                if len(args) < 2:
-                    return await reply("usage: `/addnumber <name> <+62812xxxx>`")
-                name, phone = args[0], "".join(args[1:])
+                if not args:
+                    return await reply(
+                        "📱 **Kirim nomornya aja** — nggak usah pakai command.\n\n"
+                        "Contoh: `+628123456789`\n\n"
+                        "_Pakai akun alt, jangan akun utama. Kode OTP bakal masuk ke "
+                        "app Telegram akun itu._")
+                if args[0].startswith("+"):            # cuma nomor -> nama otomatis
+                    name, phone = next_bot_name(), "".join(args)
+                elif len(args) >= 2:
+                    name, phone = args[0], "".join(args[1:])
+                else:
+                    return await reply("Kirim nomornya, contoh: `+628123456789`")
                 phone = re.sub(r"[^\d+]", "", phone)
                 if name == "all":
                     return await reply("`all` itu keyword — pilih nama lain")
@@ -1621,14 +1670,19 @@ def register_control(control):
                     "hash": sent.phone_code_hash, "session": session,
                 }
                 await reply(
-                    f"📲 kode dikirim ke `{phone}`.\n"
-                    f"balas: `/code {name} <kode>`\n\n"
-                    f"⚠️ Telegram nge-invalidate kode yang ditulis mentahan di chat. "
-                    f"Tulis pisah spasi — `/code {name} 1 2 3 4 5` — terus hapus pesannya.\n"
-                    f"Batal: `/cancel {name}`"
+                    f"📲 Kode dikirim ke `{phone}` (cek app Telegram akun itu).\n\n"
+                    f"**Balas kodenya aja** — dipisah spasi, contoh: `1 2 3 4 5`\n\n"
+                    f"_Dipisah spasi karena Telegram nge-invalidate kode yang ditulis "
+                    f"mentahan di chat. Habis login, hapus pesannya._\n"
+                    f"Batal: `/cancel {name}`",
+                    [[("❌ Batal", f"/cancel {name}")]]
                 )
 
             elif cmd == "code":
+                if not args:
+                    return await reply("Kirim kodenya aja, contoh: `1 2 3 4 5`")
+                if args[0] not in PENDING_LOGINS and len(PENDING_LOGINS) == 1:
+                    args = [list(PENDING_LOGINS)[0]] + args      # nama boleh dilewat
                 if len(args) < 2:
                     return await reply("usage: `/code <name> <kode>`")
                 name = args[0]
@@ -2270,7 +2324,9 @@ class BotApiControl:
                             await on_bot_message(chat, msg)
                         except Exception as e:
                             log.error(f"relay error: {e}")
-                if not text.startswith("/"):
+                if not text.startswith("/") and (msg.get("chat") or {}).get("type") != "private":
+                    continue      # teks biasa cuma diproses di chat pribadi
+                if not text.strip():
                     continue
                 lag = time.time() - msg["date"] if msg.get("date") else None
                 log.info(f"cmd {text.split()[0]} from {(msg.get('from') or {}).get('id')}"
