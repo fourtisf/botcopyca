@@ -512,25 +512,67 @@ async def collect_dialogs(bot, kind, keyword=None):
     return out
 
 
-def render_picker(b, kind, dialogs, keyword=None):
-    """Daftar channel/group sebagai tombol — tap buat pilih/batal."""
+def parse_pick_opts(tokens):
+    """'p2 only:group alfa' -> (2, 'group', 'alfa')"""
+    page, only, words = 1, None, []
+    for a in tokens:
+        if re.fullmatch(r"p\d+", a):
+            page = max(1, int(a[1:]))
+        elif a.startswith("only:") and a[5:] in ("group", "channel"):
+            only = a[5:]
+        else:
+            words.append(a)
+    return page, only, (" ".join(words) or None)
+
+
+def pick_opts_suffix(page=1, only=None, keyword=None):
+    return ("" if page == 1 else f" p{page}") + (f" only:{only}" if only else "") \
+           + (f" {keyword}" if keyword else "")
+
+
+def render_picker(b, kind, dialogs, keyword=None, page=1, only=None):
+    """Daftar channel/group sebagai tombol — tap buat pilih/batal, ada halaman."""
     chosen = b.source_ids if kind == "channel" else {d.id for d in b.targets}
     tog = "togsrc" if kind == "channel" else "togtgt"
+    listcmd = f"/list{'channels' if kind == 'channel' else 'groups'} {b.name}"
     what = "source channel" if kind == "channel" else "target"
+    pages = max(1, (len(dialogs) + MAX_PICK - 1) // MAX_PICK)
+    page = min(page, pages)
+    start = (page - 1) * MAX_PICK
     rows = []
-    for i, d in enumerate(dialogs[:MAX_PICK], start=1):
+    for i, d in enumerate(dialogs[start:start + MAX_PICK], start=start + 1):
         title = (getattr(d.entity, "title", "?") or "?")[:24]
         badge = "" if kind == "channel" else ("📢 " if d.is_channel and not d.is_group else "👥 ")
-        rows.append([(f"{'✅' if d.id in chosen else '▫️'} {badge}{title}", f"/{tog} {b.name} {i}")])
-    rows.append([("🔄 Refresh", f"/list{'channels' if kind == 'channel' else 'groups'} {b.name}"
-                  + (f" {keyword}" if keyword else "")),
+        rows.append([(f"{'✅' if d.id in chosen else '▫️'} {badge}{title}",
+                      f"/{tog} {b.name} {i}" + pick_opts_suffix(page, only, keyword))])
+
+    if kind == "group":      # saring jenis — channel doang / group doang / semua
+        rows.append([
+            (("👥 Group" + (" ✓" if only == "group" else "")),
+             listcmd + pick_opts_suffix(1, "group", keyword)),
+            (("📢 Channel" + (" ✓" if only == "channel" else "")),
+             listcmd + pick_opts_suffix(1, "channel", keyword)),
+            (("🔀 Semua" + (" ✓" if not only else "")),
+             listcmd + pick_opts_suffix(1, None, keyword)),
+        ])
+    if pages > 1:
+        nav = []
+        if page > 1:
+            nav.append(("◀️ Sebelumnya", listcmd + pick_opts_suffix(page - 1, only, keyword)))
+        nav.append((f"hal {page}/{pages}", listcmd + pick_opts_suffix(page, only, keyword)))
+        if page < pages:
+            nav.append(("Berikutnya ▶️", listcmd + pick_opts_suffix(page + 1, only, keyword)))
+        rows.append(nav)
+    rows.append([("🔄 Refresh", listcmd + pick_opts_suffix(page, only, keyword)),
                  ("✅ Selesai", f"/bot {b.name}")])
-    n_on = len([d for d in dialogs[:MAX_PICK] if d.id in chosen])
+
+    n_on = len([d for d in dialogs if d.id in chosen])
     head = (f"**Pilih {what}** — `{b.name}`"
             + (f" · filter `{keyword}`" if keyword else "")
-            + f"\n{n_on} dari {len(dialogs)} kepilih. Tap buat pilih / batal.")
-    if len(dialogs) > MAX_PICK:
-        head += f"\n_{len(dialogs) - MAX_PICK} lagi nggak muat — persempit pakai keyword_"
+            + (f" · {only} doang" if only else "")
+            + f"\n**{n_on}** dari {len(dialogs)} kepilih. Tap buat pilih / batal.")
+    if pages > 1:
+        head += f"\n_halaman {page} dari {pages}_"
     return head, rows
 
 
@@ -1803,9 +1845,13 @@ def register_control(control):
                     return await reply(f"usage: `/{cmd} <bot> [keyword]`")
                 b = bots[0]
                 kind = "channel" if cmd == "listchannels" else "group"
-                keyword = " ".join(args[1:]) or None
+                page, only, keyword = parse_pick_opts(args[1:])
                 dialogs = (b.learned_dialogs(kind, keyword) if getattr(b, "botmode", False)
                            else await collect_dialogs(b, kind, keyword))
+                if only == "group":
+                    dialogs = [d for d in dialogs if d.is_group]
+                elif only == "channel":
+                    dialogs = [d for d in dialogs if d.is_channel and not d.is_group]
                 if getattr(b, "botmode", False) and not dialogs and not b.known():
                     return await reply(
                         "Bot ini belum di-add ke chat mana pun.\n\n"
@@ -1817,7 +1863,7 @@ def register_control(control):
                 if not dialogs:
                     return await reply(f"`{b.name}` nggak punya {kind} yang cocok"
                                        + (f" sama `{keyword}`" if keyword else ""))
-                head, rows = render_picker(b, kind, dialogs, keyword)
+                head, rows = render_picker(b, kind, dialogs, keyword, page, only)
                 await reply(head, rows)
 
             elif cmd in ("togsrc", "togtgt"):
@@ -1827,7 +1873,8 @@ def register_control(control):
                     return await reply(f"usage: `/{cmd} <bot> <nomor>` — biasanya cukup tap "
                                        f"tombol dari `/list{'channels' if kind == 'channel' else 'groups'}`")
                 b = bots[0]
-                listing = b.listing[kind][:MAX_PICK]
+                page, only, keyword = parse_pick_opts(args[2:])
+                listing = b.listing[kind]
                 i = int(args[1])
                 if not 1 <= i <= len(listing):
                     return await reply("nomornya udah nggak cocok — tap 🔄 Refresh dulu")
@@ -1855,7 +1902,7 @@ def register_control(control):
                         fil["mode"] = "allowlist"   # tap = maksudnya milih manual
                     await b.refresh_targets()
                 save_fleet()
-                head, rows = render_picker(b, kind, b.listing[kind])
+                head, rows = render_picker(b, kind, b.listing[kind], keyword, page, only)
                 await reply(head, rows)
 
             # ---------------------------------------------------- anti-spam knobs
