@@ -170,6 +170,16 @@ Selama auto-kirim mati, CA tetep dibaca dan dicatat — cuma nggak dikirim. Jadi
 
 **Tombolnya nulis ulang pesan yang sama.** Tiap tap ngedit pesan itu juga (`editMessageText`), bukan bikin pesan baru — jadi nggak ada pesan lama nyangkut dengan centang yang udah nggak berlaku. Kalau Telegram nolak ngedit (pesannya kelamaan), otomatis jatuh ke kirim pesan baru.
 
+### Format pesan
+
+Bawaannya **CA doang** — satu pesan = satu string CA, tanpa judul, link, nama source, atau DYOR. Gampang di-copy, gampang di-paste ke bot beli. Pas batch nyala, recap-nya juga CA doang, satu per baris.
+
+| Command | Fungsi |
+|---|---|
+| `/template <bot> full` | Balik ke format rame: `🚨 NEW CALL — SOL` + link GMGN/DexScreener/Photon + nama source + DYOR |
+| `/template <bot> reset` | Balik ke CA doang |
+| `/template <bot> <teks>` | Bikin sendiri — placeholder `{ca}` `{chain}` `{links}` `{source}` |
+
 ### Anti-spam
 
 | Command | Fungsi |

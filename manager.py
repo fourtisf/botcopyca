@@ -312,7 +312,10 @@ def extract_cas(text, chains):
     return out
 
 
-DEFAULT_TEMPLATE = (
+# Bawaannya CA doang — gampang di-copy, gampang di-paste ke bot beli. Mau yang
+# rame (judul, link, source)? `/template <bot> full`.
+DEFAULT_TEMPLATE = "{ca}"
+FULL_TEMPLATE = (
     "🚨 **NEW CALL** — {chain}\n\n`{ca}`\n\n{links}\n\n{source}\n\n🔍 DYOR | NFA"
 )
 
@@ -339,6 +342,8 @@ def build_digest(cfg, items):
     if len(items) == 1:
         ca, chain, source = items[0]
         return build_message(cfg, ca, chain, source)
+    if not cfg.get("template"):        # format bawaan: CA doang, satu per baris
+        return "\n".join(ca for ca, _, _ in items)
     attrib = cfg.get("attribution", True)
     window_min = max(1, round(cfg.get("batch_window_sec", 0) / 60))
     lines = [f"📊 **CALL RECAP** — {len(items)} CA / {window_min}m", ""]
@@ -1652,15 +1657,22 @@ def register_control(control):
 
             elif cmd == "template":
                 if len(args) < 2:
-                    return await reply("usage: `/template <bot> <teks|reset>`\n"
-                                       "placeholder: `{ca}` `{chain}` `{links}` `{source}`")
+                    return await reply(
+                        "**Format pesan**\n"
+                        "Bawaannya **CA doang** — nggak ada judul, link, atau embel-embel.\n\n"
+                        "`/template <bot> full` — pakai format lengkap (judul + link + source)\n"
+                        "`/template <bot> reset` — balik ke CA doang\n"
+                        "`/template <bot> <teks>` — bikin sendiri, placeholder: "
+                        "`{ca}` `{chain}` `{links}` `{source}`")
                 bots = find_bots(args[0])
                 if not bots:
                     return await reply("no such bot")
                 b = bots[0]
                 raw = " ".join(args[1:])
-                if raw.lower() == "reset":
+                if raw.lower() in ("reset", "ca", "default"):
                     b.cfg["template"] = None
+                elif raw.lower() in ("full", "lengkap"):
+                    b.cfg["template"] = FULL_TEMPLATE
                 else:
                     tpl = raw.replace("\\n", "\n")
                     try:
@@ -1670,7 +1682,8 @@ def register_control(control):
                                            f"cuma boleh `{{ca}}` `{{chain}}` `{{links}}` `{{source}}`")
                     b.cfg["template"] = tpl
                 save_fleet()
-                await reply(f"`{b.name}` template " + ("di-reset ke bawaan" if not b.cfg["template"] else "diganti"),
+                await reply(f"`{b.name}` format pesan: "
+                            + ("**CA doang** (bawaan)" if not b.cfg["template"] else "**diganti**"),
                             [[("👁 Preview", f"/preview {b.name}")]])
 
             elif cmd == "attribution":
