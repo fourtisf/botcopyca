@@ -563,8 +563,10 @@ def render_picker(b, kind, dialogs, keyword=None, page=1, only=None):
         if page < pages:
             nav.append(("Berikutnya ▶️", listcmd + pick_opts_suffix(page + 1, only, keyword)))
         rows.append(nav)
-    rows.append([("🔄 Refresh", listcmd + pick_opts_suffix(page, only, keyword)),
-                 ("✅ Selesai", f"/bot {b.name}")])
+    opts = pick_opts_suffix(page, only, keyword)
+    rows.append([("✅ Pilih semua", f"/selall {b.name} {kind}{opts}"),
+                 ("❌ Kosongin", f"/selnone {b.name} {kind}{opts}")])
+    rows.append([("🔄 Refresh", listcmd + opts), ("✅ Selesai", f"/bot {b.name}")])
 
     n_on = len([d for d in dialogs if d.id in chosen])
     head = (f"**Pilih {what}** — `{b.name}`"
@@ -573,6 +575,9 @@ def render_picker(b, kind, dialogs, keyword=None, page=1, only=None):
             + f"\n**{n_on}** dari {len(dialogs)} kepilih. Tap buat pilih / batal.")
     if pages > 1:
         head += f"\n_halaman {page} dari {pages}_"
+    if kind == "group" and n_on > 15:
+        head += (f"\n⚠️ _{n_on} target itu banyak — tiap CA dikirim {n_on}x. "
+                 f"Pertimbangin `/batch` atau naikin `/delay`._")
     return head, rows
 
 
@@ -1115,6 +1120,7 @@ BOT_ARG_CMDS = {
     "quiet", "delay", "dryrun", "pause", "resume", "reload", "preview", "template",
     "attribution", "chains", "dedup", "dedupreset", "test", "testca", "broadcast",
     "stats", "mute", "unmute", "block", "unblock", "resetstats", "togsrc", "togtgt",
+    "selall", "selnone",
 }
 
 HELP = (
@@ -1870,6 +1876,46 @@ def register_control(control):
                     return await reply(f"`{b.name}` nggak punya {kind} yang cocok"
                                        + (f" sama `{keyword}`" if keyword else ""))
                 head, rows = render_picker(b, kind, dialogs, keyword, page, only)
+                await reply(head, rows)
+
+            elif cmd in ("selall", "selnone"):
+                bots = find_bots(args[0]) if args else []
+                kind = args[1] if len(args) > 1 and args[1] in ("channel", "group") else None
+                if not bots or not kind:
+                    return await reply("usage: `/selall <bot> <channel|group>` — biasanya "
+                                       "cukup tap tombolnya di picker")
+                b = bots[0]
+                page, only, keyword = parse_pick_opts(args[2:])
+                listing = b.listing[kind]          # cuma yang lagi kelihatan (ikut filter)
+                if not listing:
+                    return await reply("daftarnya kosong — buka pickernya dulu")
+
+                if kind == "channel":
+                    srcs = b.cfg.setdefault("source_channels", [])
+                    if cmd == "selall":
+                        for d in listing:
+                            ref = d.id if getattr(b, "botmode", False) else dialog_ref(d)
+                            if d.id not in b.source_ids and ref not in srcs:
+                                srcs.append(ref)
+                    else:
+                        drop = {str(d.id) for d in listing} | {str(dialog_ref(d)) for d in listing}
+                        srcs[:] = [x for x in srcs if str(x) not in drop]
+                    await b.refresh_sources()
+                    await b.refresh_targets()
+                else:
+                    fil = b.cfg.setdefault("send_filter", {})
+                    al = fil.setdefault("allowlist", [])
+                    if cmd == "selall":
+                        for d in listing:
+                            if not any(dialog_matches(d, e) for e in al):
+                                al.append(d.id)
+                                enable_target_kind(fil, d)
+                        fil["mode"] = "allowlist"
+                    else:
+                        al[:] = [x for x in al if not any(dialog_matches(d, x) for d in listing)]
+                    await b.refresh_targets()
+                save_fleet()
+                head, rows = render_picker(b, kind, listing, keyword, page, only)
                 await reply(head, rows)
 
             elif cmd in ("togsrc", "togtgt"):
