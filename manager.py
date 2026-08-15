@@ -737,6 +737,13 @@ async def remember_account(b):
     if acc.get("phone") and not str(acc["phone"]).startswith("+"):
         acc["phone"] = "+" + str(acc["phone"])
     b.cfg["account"] = {k: v for k, v in acc.items() if v}
+    # label lama bikinan sistem (`ub1`, `akun1118`) diganti @username-nya, sekali
+    # jalan pas start — akun yang dinamain sendiri sama user nggak diapa-apain
+    if re.fullmatch(r"ub\d+|akun\d+", b.name or ""):
+        new = account_bot_name(me, b.name)
+        if new != b.name:
+            log.info(f"[{b.name}] label diganti jadi {new}")
+            b.name = b.cfg["name"] = new
 
 
 def account_line(b):
@@ -832,6 +839,28 @@ def account_bot_name(me, fallback):
     while f"{base}{i}" in used:
         i += 1
     return f"{base}{i}"
+
+
+async def autojoin_entries(b, entries):
+    """Join chat yang disebut pakai @username/link tapi akunnya belum jadi member.
+    -> daftar catatan buat dilaporin. Diem aja kalau emang udah join."""
+    notes = []
+    if getattr(b, "botmode", False):
+        return notes
+    for e in entries:
+        s = str(e)
+        if not (s.startswith("@") or TME_RE.match(s) or INVITE_RE.match(s)):
+            continue                       # id numerik / potongan judul: nggak bisa dijoin
+        try:
+            if any(dialog_matches(d, e) for d in await b.client.get_dialogs()):
+                continue                   # udah join
+        except Exception:
+            pass
+        ok, info = await join_chat(b.client, s)
+        notes.append(("✅ join " if ok else "❌ gagal join ") + f"`{s}` — {info}")
+        if ok:
+            await asyncio.sleep(1)         # jeda kecil, join borongan gampang kena limit
+    return notes
 
 
 async def join_chat(client, ref):
@@ -1318,7 +1347,7 @@ HELP = (
     "`/addsource <bot> <#1,3 | @ch>` · `/delsource <bot> <#1,3 | @ch>`\n"
     "`/addsource <bot> @ch1 @ch2` — tambah langsung pakai @username / link t.me\n"
     "`/clearsource <bot>` — hapus SEMUA source sekaligus\n"
-    "`/join <bot> @ch` — suruh userbot join channel/group dulu\n"
+    "_(join channel jalan otomatis pas nambah source/target)_\n"
     "`/sources <bot>` — daftar source + tombol mute\n"
     "`/mute <bot> <id>` · `/unmute <bot> <id>` — matiin source sementara\n\n"
     "**Pilih target group/channel**\n"
@@ -2515,7 +2544,7 @@ def register_control(control):
                         [[("📋 Daftar channel joined", f"/listchannels {b.name}")],
                          [("⬅️ Balik", f"/bot {b.name}")]])
 
-                resolved = {}
+                resolved, joined = {}, []
                 if is_index_arg(rest):
                     if not b.listing["channel"]:
                         return await reply(f"jalanin `/listchannels {b.name}` dulu biar ada nomornya")
@@ -2530,18 +2559,12 @@ def register_control(control):
                     if cmd == "delsource":
                         entries = refs
                     else:
+                        # channel publik bisa di-resolve walau belum join, tapi
+                        # pesannya nggak bakal masuk — jadi pastiin join duluan
+                        joined = await autojoin_entries(b, refs)
                         entries, errs = [], []
                         for r in refs:
                             ok, title, why = await resolve_source_ref(b, r)
-                            if not ok and not getattr(b, "botmode", False):
-                                # belum join = nggak bakal kebaca pesannya, jadi joinin
-                                jok, jinfo = await join_chat(b.client, r)
-                                if jok:
-                                    ok, title, why = await resolve_source_ref(b, r)
-                                    if ok:
-                                        title = f"{title} — baru di-join"
-                                else:
-                                    why = f"{why}; auto-join gagal ({jinfo})"
                             if ok:
                                 entries.append(r)
                                 resolved[str(r)] = title
@@ -2569,7 +2592,8 @@ def register_control(control):
                 verb = "added" if cmd == "addsource" else "removed"
                 shown = ", ".join(f"`{t}`" + (f" ({resolved[t]})" if resolved.get(t) else "")
                                   for t in touched) or "(nothing)"
-                await reply(f"{verb}: {shown}\n"
+                await reply(("\n".join(joined) + "\n" if joined else "")
+                            + f"{verb}: {shown}\n"
                             f"`{b.name}` sekarang {len(b.source_ids)} source aktif",
                             [[("📡 Lihat source", f"/sources {b.name}"),
                               ("📋 Pilih lagi", f"/listchannels {b.name}")]])
@@ -2646,6 +2670,7 @@ def register_control(control):
                 b = bots[0]
                 rest = args[1:]
 
+                joined = []
                 if is_index_arg(rest):
                     if not b.listing["group"]:
                         return await reply(f"jalanin `/listgroups {b.name}` dulu biar ada nomornya")
@@ -2659,6 +2684,10 @@ def register_control(control):
                 else:
                     entry = " ".join(rest)
                     entry_vals = [int(entry) if entry.lstrip("-").isdigit() else entry]
+                    if cmd == "allow":
+                        # @username / link: kalau akunnya belum join, join dulu —
+                        # target yang belum di-join nggak bisa dikirimin apa-apa
+                        joined = await autojoin_entries(b, entry_vals)
 
                 fil = b.cfg.setdefault("send_filter", {})
                 al = fil.setdefault("allowlist", [])
@@ -2675,7 +2704,8 @@ def register_control(control):
                     f"\n⚠️ `{b.name}` is in `{mode}` mode — the allowlist is saved but not "
                     f"filtering anything. Switch with `/mode {b.name} allowlist`."
                 )
-                await reply(f"`{b.name}` allowlist updated "
+                await reply(("\n".join(joined) + "\n" if joined else "")
+                            + f"`{b.name}` allowlist updated "
                             f"({len(fil.get('allowlist', []))} entries) → "
                             f"{len(b.targets)} groups match" + note)
 
@@ -2787,7 +2817,6 @@ BOT_COMMANDS = [
     ("addsource", "Tambah source — /addsource <bot> #1,3"),
     ("delsource", "Hapus source — /delsource <bot> #1"),
     ("clearsource", "Hapus SEMUA source — /clearsource <bot>"),
-    ("join", "Suruh userbot join channel — /join <bot> @nama"),
     ("sources", "Daftar source + tombol mute"),
     ("mute", "Matiin source sementara — /mute <bot> <id>"),
     ("unmute", "Nyalain lagi — /unmute <bot> <id>"),

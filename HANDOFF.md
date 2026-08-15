@@ -116,7 +116,7 @@ Pengaman lain di jalur login:
 
 Userbot baru selalu lahir **aman**: `dry_run: true`, 0 source, allowlist kosong — jadi nggak bakal ngirim apa-apa sebelum lo isi sendiri.
 
-**Label userbot ngikut akunnya**, bukan urutan: login pakai akun @Jeffryyoung jadi `Jeffryyoung`, akun tanpa username jadi `akun1118` (4 digit terakhir nomor). Jadi nggak ada lagi tebak-tebakan `ub1` itu akun siapa. Nama manual lewat `/addnumber <nama> <nomor>` tetep dihormati sampai login kelar.
+**Label userbot ngikut akunnya**, bukan urutan: login pakai akun @Jeffryyoung jadi `Jeffryyoung`, akun tanpa username jadi `akun1118` (4 digit terakhir nomor). Userbot lama yang masih bernama `ub1`/`ub2` ikut diganti otomatis pas proses start — nggak perlu login ulang, dan label yang lo tentuin sendiri nggak diutak-atik. Jadi nggak ada lagi tebak-tebakan `ub1` itu akun siapa. Nama manual lewat `/addnumber <nama> <nomor>` tetep dihormati sampai login kelar.
 
 `/bots` nampilin tiap akun lengkap: label (`ub1`), **@username**, **nomor HP**, status, jumlah source & target. Identitas itu dibaca dari `get_me()` tiap kali proses start dan disimpen di `fleet.json -> userbots[].account`, jadi akun lama pun kebaca tanpa login ulang.
 
@@ -153,9 +153,11 @@ Userbot **cuma bisa baca dan kirim di chat yang dia udah join** — itu batasan 
 
 | Command | Fungsi |
 |---|---|
-| `/join <bot> @ch1 @ch2` | Suruh userbot join channel/group publik. Link `t.me/+invite` juga jalan. Ada jeda 1 detik antar-join biar nggak kena limit |
+**Join-nya otomatis.** `/addsource <bot> @nama` dan `/allow <bot> @nama` ngecek dulu akunnya udah member apa belum; kalau belum, dia join sendiri baru dipasang. Ini penting buat channel publik: `get_entity` tetep sukses walau belum join, tapi pesannya nggak akan pernah masuk — dulu ini gagal diem-diem. Ada jeda 1 detik antar-join biar nggak kena limit, dan yang udah join nggak dijoinin ulang.
 
-`/addsource <bot> @nama` **auto-join sendiri** kalau akunnya belum join channel itu — balasannya nandain "baru di-join". Kalau join-nya ditolak (channel privat, kena limit), alasannya disebutin, nggak diem-diem gagal.
+Kalau join-nya ditolak (channel privat tanpa invite, kena limit), alasannya disebutin di balasan.
+
+`/join <bot> @ch1 @ch2` masih ada buat join manual duluan, tapi nggak wajib — nggak ditaro di menu command biar nggak numpuk.
 
 ### Auto kirim CA
 
