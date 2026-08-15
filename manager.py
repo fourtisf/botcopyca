@@ -67,6 +67,7 @@ log = logging.getLogger("manager")
 
 START_TIME = time.time()
 BOT_USERNAME = ""      # filled in once the control bot logs in
+UPDATE_STATS = collections.Counter()   # what Telegram actually delivers — backs /diag
 LOG_RING = collections.deque(maxlen=200)   # backs /log so the console can show recent lines
 
 
@@ -940,6 +941,8 @@ def register_control(control):
             return
         cmd = parts[0].lower().lstrip("/").split("@")[0]   # /status@mybot -> status
         args = parts[1:]
+        if not cmd:                                        # a bare "/" — show the menu
+            cmd = "menu"
 
         async def reply(msg, buttons=None):
             kw = {}
@@ -1356,6 +1359,31 @@ def register_control(control):
                             "(pm2 yang ngidupin lagi).")
                 log.warning("restart diminta lewat /restart")
                 asyncio.get_running_loop().call_later(1.0, os._exit, 0)
+
+            elif cmd == "diag":
+                s = UPDATE_STATS
+                taps = s.get("callback_query", 0)
+                lines = [
+                    "**Diagnosa update**",
+                    f"poll: {s.get('polls', 0)} · uptime {int(time.time() - START_TIME)}s",
+                    "",
+                    f"💬 message: {s.get('message', 0)}",
+                    f"📢 channel_post: {s.get('channel_post', 0)}",
+                    f"👆 callback_query (tap tombol): **{taps}**",
+                    f"offset: `{getattr(control, 'offset', '-')}`",
+                    "",
+                ]
+                if taps == 0:
+                    lines += [
+                        "⚠️ **Belum ada tap tombol yang nyampe.**",
+                        "Coba tap tombol mana aja sekarang, terus `/diag` lagi.",
+                        "Kalau angkanya tetep 0, Telegram nggak ngirim tap-nya — "
+                        "biasanya karena pesan tombolnya dari sebelum bot restart, "
+                        "atau app-nya perlu di-refresh.",
+                    ]
+                else:
+                    lines.append("✅ tap tombol nyampe dan diproses")
+                await reply("\n".join(lines), [[("👆 Tes tap", "/diag"), ("⬅️ Menu", "/menu")]])
 
             elif cmd == "ping":
                 t0 = time.time()
@@ -1903,6 +1931,7 @@ BOT_COMMANDS = [
     ("menu", "Menu utama (tombol)"),
     ("status", "Status semua bot"),
     ("ping", "Ukur delay bot"),
+    ("diag", "Cek update dari Telegram nyampe apa nggak"),
     ("chats", "Chat yang kebaca bot"),
     ("here", "Daftarin chat ini (ketik di dalam group)"),
     ("bots", "Daftar userbot"),
@@ -2054,8 +2083,12 @@ class BotApiControl:
                     log.warning(f"getUpdates: {desc}")
                 await asyncio.sleep(3)
                 continue
+            UPDATE_STATS["polls"] += 1
             for upd in r.get("result", []):
                 self.offset = upd["update_id"] + 1
+                for k in upd:
+                    if k != "update_id":
+                        UPDATE_STATS[k] += 1
                 if not self.handler:
                     continue
                 if "callback_query" in upd:          # a tapped button
@@ -2063,11 +2096,13 @@ class BotApiControl:
                     text = cb.get("data") or ""
                     msg = {"chat": (cb.get("message") or {}).get("chat", {}),
                            "from": cb.get("from", {})}
+                    log.info(f"tap {text!r} from {(cb.get('from') or {}).get('id')}")
                     try:
                         await self.call("answerCallbackQuery", callback_query_id=cb["id"])
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.warning(f"answerCallbackQuery gagal: {e}")
                     if not msg.get("chat"):
+                        log.warning("callback tanpa chat — nggak bisa dibales")
                         continue
                 else:
                     msg = upd.get("message") or upd.get("channel_post") or {}
