@@ -1878,7 +1878,8 @@ async def main():
 
     log.info(f"CALLRELAY MANAGER up — {len(FLEET)} userbots"
              + ("" if CREDS_OK else "  [MODE TERBATAS — nunggu api_id]"))
-    runners = [b.runner for b in FLEET]
+    # the bot-mode relay has no runner of its own — it rides the control poller
+    runners = [b.runner for b in FLEET if b.runner is not None]
     if control:
         runners.append(asyncio.create_task(control.run_until_disconnected()))
     if not runners:
