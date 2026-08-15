@@ -30,6 +30,7 @@ import re
 import sqlite3
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -896,6 +897,7 @@ HELP = (
     "`/test <bot>` — kirim pesan tes ke semua target (cek izin)\n"
     "`/dedupreset <bot>` — lupain CA yang udah pernah dipost\n\n"
     "**Sistem**\n"
+    "`/ping` — ukur delay bot\n"
     "`/version` — mode, uptime, jumlah bot\n"
     "`/log [n]` — log terakhir\n"
     "`/admins` · `/addadmin <id>` · `/deladmin <id>`\n"
@@ -1155,6 +1157,16 @@ def register_control(control):
                 await reply("\n".join(out), [[("⬅️ Balik", f"/bot {b.name}")]])
 
             # ---------------------------------------------------- sistem
+            elif cmd == "ping":
+                t0 = time.time()
+                sent = getattr(event, "date", None)
+                lag = f"{t0 - sent:.1f}s" if sent else "?"
+                await reply(f"🏓 pong\n"
+                            f"pesan lo → gue: **{lag}**\n"
+                            f"_kalau angkanya > 3s terus-terusan, kemungkinan ada 2 proses "
+                            f"polling bot yang sama — cek log `/log 10`_")
+                log.info(f"/ping lag={lag} reply={time.time() - t0:.2f}s")
+
             elif cmd in ("version", "info"):
                 up = int(time.time() - START_TIME)
                 hh, mm = up // 3600, (up % 3600) // 60
@@ -1689,8 +1701,17 @@ class BotApiControl:
     def _post(self, method, params, timeout):
         url = f"https://api.telegram.org/bot{self.token}/{method}"
         data = urllib.parse.urlencode(params).encode()
-        with urllib.request.urlopen(url, data=data, timeout=timeout) as r:
-            return json.loads(r.read().decode())
+        try:
+            with urllib.request.urlopen(url, data=data, timeout=timeout) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            # Telegram explains itself in the body ("Conflict: terminated by other
+            # getUpdates request", "Forbidden: bot was blocked", …) — surface that
+            # instead of a bare "HTTP Error 409".
+            try:
+                return json.loads(e.read().decode())
+            except Exception:
+                return {"ok": False, "description": f"HTTP {e.code}"}
 
     async def call(self, method, http_timeout=15, **params):
         return await asyncio.to_thread(self._post, method, params, http_timeout)
@@ -1736,7 +1757,7 @@ class BotApiControl:
         return self
 
     async def run_until_disconnected(self):
-        log.info("control bot polling via Bot API (mode terbatas — tanpa api_id)")
+        log.info("control bot polling via Bot API (long poll 50s)")
         while True:
             try:
                 r = await self.call("getUpdates", http_timeout=70, offset=self.offset,
@@ -1744,7 +1765,18 @@ class BotApiControl:
                                     allowed_updates='["message","channel_post","callback_query"]')
             except Exception as e:
                 log.warning(f"getUpdates failed: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(3)
+                continue
+            if not r.get("ok"):
+                desc = r.get("description", "?")
+                if "Conflict" in desc:
+                    # two pollers on one token: Telegram hands each update to whoever
+                    # asks first, so replies look randomly slow or missing
+                    log.error("KONFLIK: ada proses lain yang polling bot yang sama. "
+                              "Cek `pm2 list` dan `ps aux | grep manager.py`, sisain satu.")
+                else:
+                    log.warning(f"getUpdates: {desc}")
+                await asyncio.sleep(3)
                 continue
             for upd in r.get("result", []):
                 self.offset = upd["update_id"] + 1
@@ -1772,10 +1804,21 @@ class BotApiControl:
                             log.error(f"relay error: {e}")
                 if not text.startswith("/"):
                     continue
-                try:
-                    await self.handler(BotApiEvent(self, msg, text))
-                except Exception as e:
-                    log.error(f"control handler error: {e}")
+                lag = time.time() - msg["date"] if msg.get("date") else None
+                log.info(f"cmd {text.split()[0]} from {(msg.get('from') or {}).get('id')}"
+                         + (f" (lag {lag:.1f}s)" if lag is not None else ""))
+                # dispatch off the poll loop: a slow command (/test walks every
+                # target with a delay) must not hold up the next getUpdates
+                asyncio.create_task(self._dispatch(BotApiEvent(self, msg, text)))
+
+    async def _dispatch(self, event):
+        t0 = time.time()
+        try:
+            await self.handler(event)
+        except Exception as e:
+            log.error(f"control handler error: {e}")
+        else:
+            log.info(f"cmd {event.raw_text.split()[0]} done in {time.time() - t0:.1f}s")
 
 
 class BotApiEvent:
@@ -1787,6 +1830,7 @@ class BotApiEvent:
         self._chat = self.chat.get("id")
         self.raw_text = text
         self.sender_id = (msg.get("from") or {}).get("id")
+        self.date = msg.get("date")          # unix ts, lets /ping measure real lag
 
     async def reply(self, text, buttons=None, **_kw):
         await self._ctrl.send(self._chat, text, buttons)
