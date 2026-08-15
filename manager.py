@@ -111,7 +111,11 @@ if not CREDS_OK and not CONTROL_BOT_TOKEN:
         f"dan CONTROL_BOT_TOKEN juga kosong — nggak ada yang bisa dijalanin. {GET_CREDS}"
     )
 if not FLEET_PATH.exists():
-    raise SystemExit("fleet.json not found — see HANDOFF.md")
+    # fleet.json itu state hidup punya server, bukan bagian repo (lihat .gitignore),
+    # jadi deploy fresh mulai dari kosong dan diisi lewat control bot.
+    FLEET_PATH.write_text(json.dumps({"admin_user_ids": [], "userbots": []}, indent=2))
+    log.warning("fleet.json belum ada — dibikinin kosong. Orang pertama yang chat "
+                "control bot bakal jadi admin.")
 
 with open(FLEET_PATH) as f:
     FLEET_CONFIG = json.load(f)
@@ -1242,6 +1246,14 @@ HELP = (
 def register_control(control):
     @control.on(events.NewMessage())
     async def on_cmd(event):
+        if not ADMIN_IDS and is_private_chat(event):
+            # deploy fresh: yang pertama nyapa jadi admin, biar nggak kekunci di luar
+            ADMIN_IDS.add(event.sender_id)
+            FLEET_CONFIG["admin_user_ids"] = sorted(ADMIN_IDS)
+            save_fleet()
+            log.warning(f"admin pertama diklaim oleh {event.sender_id}")
+            await event.reply(f"👑 Lo kedaftar jadi admin (`{event.sender_id}`).\n"
+                              f"Tambah admin lain pakai `/admin add <id>`.")
         if event.sender_id not in ADMIN_IDS:
             return  # silently ignore non-admins
         raw = (event.raw_text or "").strip()

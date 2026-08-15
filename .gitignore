@@ -13,3 +13,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# konfigurasi hidup di server — jangan pernah ketiban git pull
+fleet.json
+config.json

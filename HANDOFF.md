@@ -24,14 +24,15 @@ Semua userbot **share satu `api_id`/`api_hash`** (api_id itu per-app, bukan per-
 
 1. **API creds:** https://my.telegram.org → `api_id` + `api_hash` (sekali, dipakai semua).
 2. **Control bot:** @BotFather `/newbot` → token.
-3. **Admin user ID lo:** chat @userinfobot → catat ID numerik → masuk `fleet.json -> admin_user_ids`.
+3. **Admin:** nggak usah diisi manual — orang **pertama** yang chat control bot otomatis jadi admin (kesimpen ke `fleet.json`). Mau manual? chat @userinfobot → ID numerik → `fleet.json -> admin_user_ids`.
 4. Tiap akun userbot: **join semua source channel + join semua group tujuan**-nya.
 5. Di VPS:
    ```bash
    cd /opt && unzip callrelay.zip && cd callrelay
    pip3 install -r requirements.txt
    cp .env.example .env && nano .env       # API_ID, API_HASH, CONTROL_BOT_TOKEN
-   nano fleet.json                          # admin id + tiap userbot: session, sources, allowlist
+   # fleet.json dibikin otomatis pas pertama jalan — nggak usah disiapin.
+   # Mau isi manual: cp fleet.example.json fleet.json && nano fleet.json
    ```
 6. **Lihat group tiap userbot** buat isi allowlist:
    ```bash
@@ -186,6 +187,10 @@ CA yang masuk pas jam tenang **nggak dicatet di dedup db**, jadi kalau muncul la
 Semua perubahan lewat command langsung ke-save ke `fleet.json`. Non-admin yang chat bot → di-ignore diam-diam.
 
 Karena akun bisa ditambah lewat chat, `fleet.json` boleh mulai dengan `"userbots": []` — asal `CONTROL_BOT_TOKEN` keisi, prosesnya tetep jalan dan lo tinggal `/addnumber`.
+
+⚠️ **`fleet.json` itu state hidup punya server, bukan bagian repo** — dia ada di `.gitignore` bareng `.env`, `*.session`, dan `*.db`. Contohnya ada di `fleet.example.json`. Artinya `git pull` **nggak akan** nimpa config lo, dan jangan pernah `git stash` di folder deploy: itu bakal ngebalikin file yang ke-track ke versi repo. Kalau `git pull` nolak gara-gara ada perubahan lokal, cek dulu `git status` — bukan langsung di-stash.
+
+Backup config: `cp fleet.json ~/fleet.backup.json` (isinya login mapping, source, target — bukan rahasia login, tapi sayang kalau ilang).
 
 ## fleet.json
 
