@@ -824,6 +824,10 @@ def map_plain_text(raw):
     if PHONE_RE.match(raw):
         return "/addnumber " + re.sub(r"[^0-9+]", "", raw)
     digits = re.sub(r"\D", "", raw)
+    # login lagi nunggu password 2FA -> apa pun yang diketik itu passwordnya
+    waiting = [n for n, p in PENDING_LOGINS.items() if p.get("needs_password")]
+    if waiting and not raw.startswith("/"):
+        return f"/pass {waiting[-1]} {raw}"
     if PENDING_LOGINS and re.fullmatch(r"[\d\s\-]{4,20}", raw) and 4 <= len(digits) <= 8:
         return f"/code {list(PENDING_LOGINS)[-1]} {digits}"
     # cuma @username / link t.me -> langsung jadiin source (kalau botnya cuma satu,
@@ -1260,7 +1264,8 @@ HELP = (
     "Terus balas kode OTP-nya, juga tanpa command.\n"
     "`/addnumber <+62...>` · `/pass <2fa>` · `/cancel <name>`\n"
     "`/bots` — daftar userbot · `/bot <name>` — panel satu userbot\n"
-    "`/delbot <name>` — copot userbot dari fleet\n\n"
+    "`/delbot <name>` — copot userbot dari fleet\n"
+    "`/reset` — hapus SEMUA (userbot, source, target) — ada konfirmasi\n\n"
     "**Auto kirim CA**\n"
     "`/auto <bot>` — panel on/off + pilih source & group tujuan\n"
     "`/auto <bot> on|off` — nyalain / matiin auto-kirim\n\n"
@@ -2039,7 +2044,13 @@ def register_control(control):
                 try:
                     await p["client"].sign_in(phone=p["phone"], code=code, phone_code_hash=p["hash"])
                 except SessionPasswordNeededError:
-                    return await reply(f"akun ini pakai 2FA → `/pass {name} <password>`")
+                    p["needs_password"] = True     # pesan polos berikutnya = passwordnya
+                    return await reply(
+                        f"🔐 Akun ini pakai **2FA**.\n"
+                        f"**Kirim password Telegram-nya aja** — nggak usah pakai command.\n\n"
+                        f"_Itu password 2FA/cloud password akun `{p['phone']}`, bukan OTP. "
+                        f"Habis login, hapus pesannya._",
+                        [[("❌ Batal", f"/cancel {name}")]])
                 except PhoneCodeInvalidError:
                     return await reply("kode salah — coba lagi")
                 except PhoneCodeExpiredError:
@@ -2060,8 +2071,47 @@ def register_control(control):
                 try:
                     await p["client"].sign_in(password=" ".join(args[1:]))
                 except Exception as e:
-                    return await reply(f"2FA gagal: `{e}`")
+                    p["needs_password"] = True     # tetep nunggu, biar bisa ngetik ulang
+                    hint = "Password 2FA-nya salah" if "Password" in type(e).__name__ \
+                           else f"2FA gagal: `{e}`"
+                    return await reply(f"❌ {hint} — kirim ulang passwordnya aja.",
+                                       [[("❌ Batal", f"/cancel {name}")]])
+                p.pop("needs_password", None)
                 await finish_login(name)
+
+            elif cmd in ("reset", "resetall"):
+                real = [b for b in FLEET if not getattr(b, "botmode", False)]
+                n_src = sum(len(b.cfg.get("source_channels", [])) for b in FLEET)
+                n_tgt = sum(len(b.targets) for b in FLEET)
+                if not args or args[0] != "yes":
+                    return await reply(
+                        f"⚠️ **Hapus semua?**\n\n"
+                        f"🤖 {len(real)} userbot dicopot\n"
+                        f"📡 {n_src} source dihapus\n"
+                        f"🎯 {n_tgt} target dihapus\n"
+                        f"⏳ {len(PENDING_LOGINS)} login yang lagi nunggu dibatalin\n\n"
+                        f"_Admin sama file session **nggak** ikut kehapus — akun bisa "
+                        f"dipasang lagi tanpa OTP ulang._",
+                        [[("🗑 Ya, hapus semua", "/reset yes"), ("↩️ Batal", "/start")]])
+                for name in list(PENDING_LOGINS):
+                    p = PENDING_LOGINS.pop(name)
+                    try:
+                        await p["client"].disconnect()
+                    except Exception:
+                        pass
+                for b in list(real):
+                    await detach_userbot(b)
+                for b in FLEET:                     # bot-mode relay: bersihin isinya
+                    b.cfg["source_channels"] = []
+                    b.cfg.pop("muted_sources", None)
+                    b.cfg.setdefault("send_filter", {})["allowlist"] = []
+                    b.cfg["send_filter"]["dry_run"] = True
+                    await b.refresh_sources()
+                    await b.refresh_targets()
+                save_fleet()
+                await reply("🗑 **Semua dihapus.** Mulai dari nol.\n\n"
+                            "Kirim nomor HP (`+628...`) buat pasang userbot lagi.",
+                            [[("🚀 Mulai", "/start")]])
 
             elif cmd == "cancel":
                 name = args[0] if args else ""
@@ -2688,6 +2738,7 @@ BOT_COMMANDS = [
     ("log", "Log terakhir — /log 10"),
     ("version", "Mode, uptime, jumlah bot"),
     ("addnumber", "Tambah userbot (butuh api_id)"),
+    ("reset", "Hapus semua — userbot, source, target"),
     ("help", "Semua command"),
 ]
 

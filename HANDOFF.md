@@ -91,7 +91,8 @@ Source channel otomatis dikecualiin dari daftar target, jadi nggak mungkin echo.
 |---|---|
 | `/addnumber <name> <+62...>` | Bikin userbot baru + kirim OTP ke nomor itu |
 | `/code <name> <kode>` | Masukin OTP. Angka doang yang dibaca, jadi boleh dipisah spasi |
-| `/pass <name> <password>` | Kalau akunnya pakai 2FA |
+| `/pass <name> <password>` | Kalau akunnya pakai 2FA. Nggak usah diketik manual — begitu bot minta 2FA, **pesan berikutnya apa pun yang lo kirim dianggap passwordnya** |
+| `/reset` | Hapus SEMUA: userbot, source, target, login yang lagi nunggu. Nanya konfirmasi dulu. Admin & file session nggak ikut kehapus |
 | `/cancel <name>` | Batalin login yang lagi nunggu |
 | `/delbot` | Daftar akun buat dihapus (tombol) |
 | `/delbot <name>` | Copot userbot dari fleet — nanya konfirmasi dulu; file session tetep di disk |
