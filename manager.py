@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import re
+import socket
 import sqlite3
 import sys
 import time
@@ -67,6 +68,18 @@ log = logging.getLogger("manager")
 
 START_TIME = time.time()
 BOT_USERNAME = ""      # filled in once the control bot logs in
+
+# Many VPSes advertise IPv6 but have no working route. Python then burns the
+# whole socket timeout on the AAAA address before falling back to IPv4, which
+# showed up as every reply taking ~15s. Resolve A records only unless asked.
+FORCE_IPV4 = (os.getenv("ALLOW_IPV6") or "").strip().lower() not in ("1", "true", "yes")
+if FORCE_IPV4:
+    _real_getaddrinfo = socket.getaddrinfo
+
+    def _getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
+        return _real_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+    socket.getaddrinfo = _getaddrinfo_ipv4
 UPDATE_STATS = collections.Counter()   # what Telegram actually delivers — backs /diag
 LOG_RING = collections.deque(maxlen=200)   # backs /log so the console can show recent lines
 
@@ -1909,12 +1922,17 @@ def register_control(control):
 
 # ---------------------------------------------------------------- Bot API fallback console
 
-def botapi_post(token, method, params, timeout=15):
+def botapi_post(token, method, params, timeout=30):
     url = f"https://api.telegram.org/bot{token}/{method}"
     data = urllib.parse.urlencode(params).encode()
+    t0 = time.monotonic()
     try:
         with urllib.request.urlopen(url, data=data, timeout=timeout) as r:
-            return json.loads(r.read().decode())
+            out = json.loads(r.read().decode())
+        dt = time.monotonic() - t0
+        if dt > 3 and method != "getUpdates":
+            log.warning(f"{method} lambat: {dt:.1f}s (jaringan VPS ke Telegram)")
+        return out
     except urllib.error.HTTPError as e:
         # Telegram explains itself in the body ("Conflict: terminated by other
         # getUpdates request", "Forbidden: bot was blocked", …) — surface that
