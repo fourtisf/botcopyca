@@ -22,6 +22,7 @@ Run:
 """
 
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -36,6 +37,11 @@ from pathlib import Path
 import base58
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, utils
+
+try:
+    from telethon import Button          # inline keyboards on the MTProto path
+except ImportError:                       # pragma: no cover
+    Button = None
 from telethon.errors import (
     ChatWriteForbiddenError,
     FloodWaitError,
@@ -57,6 +63,22 @@ DB_PATH = BASE / "callrelay.db"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("manager")
+
+START_TIME = time.time()
+LOG_RING = collections.deque(maxlen=200)   # backs /log so the console can show recent lines
+
+
+class _RingHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            LOG_RING.append(self.format(record))
+        except Exception:
+            pass
+
+
+_ring = _RingHandler()
+_ring.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S"))
+logging.getLogger().addHandler(_ring)
 
 GET_CREDS = ("Ambil api_id + api_hash di https://my.telegram.org "
              "(login → API development tools), terus isi ke .env. Lihat HANDOFF.md")
@@ -630,11 +652,49 @@ async def sender_loop(bot: Userbot):
 
 # ---------------------------------------------------------------- control bot
 
+# ---------------------------------------------------------------- inline keyboards
+# Buttons carry the command they stand for, so a tap and a typed command take
+# the exact same path through on_cmd(). Works on both transports.
+
+def menu_main():
+    return [
+        [("📊 Status", "/status"), ("📈 Stats", "/stats")],
+        [("🤖 Userbot", "/bots"), ("➕ Tambah akun", "/addnumber")],
+        [("🛡 Anti-spam", "/antispam"), ("❓ Command", "/help")],
+        [("🔄 Refresh", "/menu"), ("🩺 Info", "/version")],
+    ]
+
+
+def menu_bot(b):
+    dry = b.cfg.get("send_filter", {}).get("dry_run", False)
+    return [
+        [("▶️ Resume" if b.paused else "⏸ Pause", f"/{'resume' if b.paused else 'pause'} {b.name}"),
+         ("🚀 Go live" if dry else "🧪 Dry-run", f"/dryrun {b.name} {'off' if dry else 'on'}")],
+        [("📡 Source", f"/listchannels {b.name}"), ("🎯 Target", f"/listgroups {b.name}")],
+        [("👁 Preview", f"/preview {b.name}"), ("🔧 Test kirim", f"/test {b.name}")],
+        [("🔄 Reload", f"/reload {b.name}"), ("⬅️ Balik", "/bots")],
+    ]
+
+
+def to_telethon_buttons(rows):
+    if not rows or Button is None:
+        return None
+    return [[Button.inline(label, data.encode()) for label, data in row] for row in rows]
+
+
+def to_botapi_markup(rows):
+    return json.dumps({"inline_keyboard": [
+        [{"text": label, "callback_data": data[:64]} for label, data in row] for row in rows
+    ]})
+
+
 HELP = (
-    "**CALLRELAY control**\n\n"
+    "**CALLRELAY control**\n"
+    "_tap `/menu` buat versi tombol_\n\n"
     "**Akun**\n"
     "`/addnumber <name> <+62...>` — tambah userbot baru (login OTP)\n"
     "`/code <name> <kode>` · `/pass <name> <2fa>` · `/cancel <name>`\n"
+    "`/bots` — daftar userbot · `/bot <name>` — panel satu userbot\n"
     "`/delbot <name>` — copot userbot dari fleet\n\n"
     "**Pilih source channel**\n"
     "`/listchannels <bot> [keyword]` — channel yang di-join, bernomor\n"
@@ -652,11 +712,22 @@ HELP = (
     "`/cap <bot> <n|off>` — max pesan per group per hari\n"
     "`/quiet <bot> <23:00-07:00|off>` — jam tenang\n"
     "`/delay <bot> <sec>` — jeda antar group\n\n"
+    "**Format pesan**\n"
+    "`/preview <bot>` — contoh pesan yang bakal dikirim\n"
+    "`/template <bot> <teks|reset>` — format sendiri: `{ca}` `{chain}` `{links}` `{source}`\n"
+    "`/attribution <bot> <on|off>` — tampilin nama source\n"
+    "`/chains <bot> <sol|evm|both>` · `/dedup <bot> <jam>`\n\n"
     "**Operasi**\n"
-    "`/status` · `/stats <bot|all>`\n"
+    "`/menu` · `/status` · `/stats <bot|all>`\n"
     "`/pause <bot|all>` · `/resume <bot|all>`\n"
     "`/dryrun <bot|all> <on|off>`\n"
     "`/reload <bot|all>` — re-resolve habis join/leave\n"
+    "`/test <bot>` — kirim pesan tes ke semua target (cek izin)\n"
+    "`/dedupreset <bot>` — lupain CA yang udah pernah dipost\n\n"
+    "**Sistem**\n"
+    "`/version` — mode, uptime, jumlah bot\n"
+    "`/log [n]` — log terakhir\n"
+    "`/admins` · `/addadmin <id>` · `/deladmin <id>`\n"
 )
 
 
@@ -671,8 +742,13 @@ def register_control(control):
         cmd = parts[0].lower().lstrip("/").split("@")[0]   # /status@mybot -> status
         args = parts[1:]
 
-        async def reply(msg):
-            await event.reply(msg, parse_mode="md", link_preview=False)
+        async def reply(msg, buttons=None):
+            kw = {}
+            if buttons:
+                # BotApiEvent takes the neutral form; the MTProto path needs Button objects
+                kw["buttons"] = (buttons if isinstance(event, BotApiEvent)
+                                 else to_telethon_buttons(buttons))
+            await event.reply(msg, parse_mode="md", link_preview=False, **kw)
 
         async def finish_login(name):
             """Sign-in done — build the config, attach to the fleet, persist."""
@@ -695,8 +771,230 @@ def register_control(control):
             )
 
         try:
-            if cmd in ("help", "start"):
-                await reply(HELP)
+            if cmd in ("help", "start", "menu"):
+                if cmd == "help":
+                    await reply(HELP, menu_main())
+                else:
+                    head = "**CALLRELAY**\n"
+                    if not CREDS_OK:
+                        head += "⚠️ mode terbatas — belum ada `api_id`, relay belum jalan\n"
+                    head += (f"\n{len(FLEET)} userbot · jam server {time.strftime('%H:%M')}\n"
+                             f"_tap tombol, atau ketik `/help` buat semua command_")
+                    await reply(head, menu_main())
+
+            # ---------------------------------------------------- userbot panel
+            elif cmd == "bots":
+                if not FLEET:
+                    return await reply(
+                        "belum ada userbot.\n\n"
+                        + ("tambah: `/addnumber ub1 +628...`" if CREDS_OK
+                           else "⚠️ butuh `api_id` dulu sebelum bisa nambah akun"),
+                        menu_main())
+                rows = [[(f"{'⏸' if b.paused else '🧪' if b.cfg.get('send_filter',{}).get('dry_run') else '▶️'} {b.name}",
+                          f"/bot {b.name}")] for b in FLEET]
+                rows.append([("⬅️ Menu", "/menu")])
+                await reply(f"**{len(FLEET)} userbot** — pilih buat ngatur:", rows)
+
+            elif cmd == "bot":
+                bots = find_bots(args[0]) if args else []
+                if not bots:
+                    return await reply("usage: `/bot <name>`")
+                b = bots[0]
+                fil = b.cfg.get("send_filter", {})
+                dry = fil.get("dry_run", False)
+                state = "⏸ paused" if b.paused else ("🧪 dry-run" if dry else "▶️ live")
+                c = b.counters
+                txt = (
+                    f"**{b.name}** — {state}\n\n"
+                    f"📡 source: {len(b.source_ids)}\n"
+                    f"🎯 target: {len(b.targets)} ({'group+channel' if fil.get('include_channels') and fil.get('include_groups', True) else 'channel' if fil.get('include_channels') else 'group'})\n"
+                    f"⛓ chain: {', '.join(b.cfg.get('chains', []))}\n"
+                    f"🔁 dedup: {b.cfg.get('dedup_hours', 0) or 'selamanya'}\n"
+                    f"⏱ delay: {b.cfg.get('delay_between_groups_sec', 5)}s"
+                    + (f" · batch {b.cfg['batch_window_sec'] // 60}m" if b.cfg.get("batch_window_sec") else "")
+                    + (f" · cap {b.cfg['max_per_day_per_group']}/hari" if b.cfg.get("max_per_day_per_group") else "")
+                    + (f" · quiet {b.cfg['quiet_hours']}" if b.cfg.get("quiet_hours") else "")
+                    + f"\n\n📊 relayed {c['relayed']} · dup {c['dup_skips']} · ok {c['sends_ok']} · fail {c['sends_fail']}"
+                )
+                await reply(txt, menu_bot(b))
+
+            elif cmd == "antispam":
+                lines = ["**Anti-spam**", ""]
+                if not FLEET:
+                    lines.append("_belum ada userbot_")
+                for b in FLEET:
+                    lines.append(
+                        f"• `{b.name}` — batch "
+                        f"{str(b.cfg.get('batch_window_sec', 0) // 60) + 'm' if b.cfg.get('batch_window_sec') else 'off'}"
+                        f" · cap {b.cfg.get('max_per_day_per_group') or 'off'}"
+                        f" · quiet {b.cfg.get('quiet_hours') or 'off'}"
+                        f" · delay {b.cfg.get('delay_between_groups_sec', 5)}s")
+                lines += [
+                    "",
+                    "`/batch <bot> <menit>` — kumpulin CA jadi 1 pesan recap",
+                    "`/cap <bot> <n>` — max pesan per group per hari",
+                    "`/quiet <bot> <23:00-07:00>` — jam tenang",
+                    "`/delay <bot> <sec>` — jeda antar group",
+                ]
+                await reply("\n".join(lines), [[("⬅️ Menu", "/menu")]])
+
+            # ---------------------------------------------------- format pesan
+            elif cmd == "preview":
+                bots = find_bots(args[0]) if args else []
+                if not bots:
+                    return await reply("usage: `/preview <bot>`")
+                b = bots[0]
+                demo = [("So11111111111111111111111111111111111111112", "sol", "Alpha Calls"),
+                        ("0x1f9840a85d5af5bf1d1762f925bdaddc4201f984", "evm", "Beta Signals")]
+                one = build_message(b.cfg, *demo[0])
+                out = f"**Preview `{b.name}` — pesan satuan**\n\n{one}"
+                if b.cfg.get("batch_window_sec"):
+                    out += f"\n\n──────\n**Kalau batch kena ≥2 CA**\n\n{build_digest(b.cfg, demo)}"
+                await reply(out, [[("⬅️ Balik", f"/bot {b.name}")]])
+
+            elif cmd == "template":
+                if len(args) < 2:
+                    return await reply("usage: `/template <bot> <teks|reset>`\n"
+                                       "placeholder: `{ca}` `{chain}` `{links}` `{source}`")
+                bots = find_bots(args[0])
+                if not bots:
+                    return await reply("no such bot")
+                b = bots[0]
+                raw = " ".join(args[1:])
+                if raw.lower() == "reset":
+                    b.cfg["template"] = None
+                else:
+                    tpl = raw.replace("\\n", "\n")
+                    try:
+                        tpl.format(ca="x", chain="SOL", links="l", source="s")
+                    except (KeyError, IndexError, ValueError) as e:
+                        return await reply(f"template ditolak: `{e}`\n"
+                                           f"cuma boleh `{{ca}}` `{{chain}}` `{{links}}` `{{source}}`")
+                    b.cfg["template"] = tpl
+                save_fleet()
+                await reply(f"`{b.name}` template " + ("di-reset ke bawaan" if not b.cfg["template"] else "diganti"),
+                            [[("👁 Preview", f"/preview {b.name}")]])
+
+            elif cmd == "attribution":
+                if len(args) < 2 or args[1].lower() not in ("on", "off"):
+                    return await reply("usage: `/attribution <bot> <on|off>`")
+                bots = find_bots(args[0])
+                if not bots:
+                    return await reply("no such bot")
+                bots[0].cfg["attribution"] = args[1].lower() == "on"
+                save_fleet()
+                await reply(f"`{bots[0].name}` attribution = {args[1].lower()}",
+                            [[("👁 Preview", f"/preview {bots[0].name}")]])
+
+            elif cmd == "chains":
+                if len(args) < 2 or args[1].lower() not in ("sol", "evm", "both"):
+                    return await reply("usage: `/chains <bot> <sol|evm|both>`")
+                bots = find_bots(args[0])
+                if not bots:
+                    return await reply("no such bot")
+                val = args[1].lower()
+                bots[0].cfg["chains"] = ["sol", "evm"] if val == "both" else [val]
+                save_fleet()
+                await reply(f"`{bots[0].name}` chains = {', '.join(bots[0].cfg['chains'])}")
+
+            elif cmd == "dedup":
+                if len(args) < 2:
+                    return await reply("usage: `/dedup <bot> <jam>` — `0` = CA yang udah dipost "
+                                       "nggak pernah diulang")
+                bots = find_bots(args[0])
+                if not bots:
+                    return await reply("no such bot")
+                try:
+                    h = max(0, int(args[1]))
+                except ValueError:
+                    return await reply("jamnya angka ya")
+                bots[0].cfg["dedup_hours"] = h
+                save_fleet()
+                await reply(f"`{bots[0].name}` dedup = " + ("selamanya (0)" if not h else f"{h} jam"))
+
+            elif cmd == "dedupreset":
+                bots = find_bots(args[0]) if args else []
+                if not bots:
+                    return await reply("usage: `/dedupreset <bot>`")
+                n = db.execute("DELETE FROM posted WHERE bot=?", (bots[0].name,)).rowcount
+                db.commit()
+                await reply(f"`{bots[0].name}` lupa {n} CA — bakal di-relay lagi kalau muncul")
+
+            # ---------------------------------------------------- test kirim
+            elif cmd == "test":
+                bots = find_bots(args[0]) if args else []
+                if not bots:
+                    return await reply("usage: `/test <bot>` — kirim pesan tes ke semua target")
+                b = bots[0]
+                if not b.targets:
+                    return await reply(f"`{b.name}` belum punya target. `/listgroups {b.name}` dulu")
+                await reply(f"ngirim tes ke {len(b.targets)} chat…")
+                probe = ("🔧 **CALLRELAY test**\n\nKalau lo lihat pesan ini, izin kirim ke chat "
+                         "ini aman. Aman dihapus.")
+                ok, fail = [], []
+                for d in b.targets:
+                    try:
+                        await b.client.send_message(d.entity, probe, parse_mode="md", link_preview=False)
+                        ok.append(dialog_name(d))
+                    except Exception as e:
+                        fail.append(f"{dialog_name(d)} — {type(e).__name__}")
+                    await asyncio.sleep(b.cfg.get("delay_between_groups_sec", 5))
+                out = [f"**Hasil tes `{b.name}`**", ""]
+                out += [f"✅ {x}" for x in ok]
+                out += [f"❌ {x}" for x in fail]
+                if fail:
+                    out += ["", "_yang ❌ biasanya akun belum punya izin kirim di situ_"]
+                await reply("\n".join(out), [[("⬅️ Balik", f"/bot {b.name}")]])
+
+            # ---------------------------------------------------- sistem
+            elif cmd in ("version", "info"):
+                up = int(time.time() - START_TIME)
+                hh, mm = up // 3600, (up % 3600) // 60
+                try:
+                    import telethon as _tl
+                    tlver = getattr(_tl, "__version__", "?")
+                except Exception:
+                    tlver = "?"
+                await reply(
+                    f"**CALLRELAY**\n"
+                    f"mode: {'✅ penuh (MTProto)' if CREDS_OK else '⚠️ terbatas (Bot API, belum ada api_id)'}\n"
+                    f"uptime: {hh}j {mm}m · jam server {time.strftime('%H:%M %Z')}\n"
+                    f"userbot: {len(FLEET)} · admin: {len(ADMIN_IDS)}\n"
+                    f"python {sys.version.split()[0]} · telethon {tlver}\n"
+                    f"db: `{DB_PATH.name}`",
+                    [[("⬅️ Menu", "/menu")]])
+
+            elif cmd == "log":
+                n = 15
+                if args:
+                    try:
+                        n = max(1, min(50, int(args[0])))
+                    except ValueError:
+                        pass
+                tail = list(LOG_RING)[-n:]
+                if not tail:
+                    return await reply("log masih kosong")
+                await reply("**Log terakhir**\n```\n" + "\n".join(tail)[-3500:] + "\n```")
+
+            elif cmd == "admins":
+                await reply("**Admin**\n" + "\n".join(f"• `{i}`" for i in sorted(ADMIN_IDS))
+                            + "\n\n`/addadmin <id>` · `/deladmin <id>`")
+
+            elif cmd in ("addadmin", "deladmin"):
+                if not args or not args[0].lstrip("-").isdigit():
+                    return await reply(f"usage: `/{cmd} <user_id>` — ID numerik, dari @userinfobot")
+                uid = int(args[0])
+                if cmd == "addadmin":
+                    ADMIN_IDS.add(uid)
+                else:
+                    if uid == event.sender_id:
+                        return await reply("nggak bisa ngehapus diri sendiri")
+                    if len(ADMIN_IDS) <= 1:
+                        return await reply("ini admin terakhir — nggak bisa dihapus")
+                    ADMIN_IDS.discard(uid)
+                FLEET_CONFIG["admin_user_ids"] = sorted(ADMIN_IDS)
+                save_fleet()
+                await reply(f"admin sekarang: {', '.join(f'`{i}`' for i in sorted(ADMIN_IDS))}")
 
             # ---------------------------------------------------- add account by phone
             elif cmd in ("addnumber", "addbot"):
@@ -954,7 +1252,9 @@ def register_control(control):
                         f"ok {b.counters['sends_ok']} fail {b.counters['sends_fail']}"
                         + (f"\n   ⚙️ {' · '.join(knobs)}" if knobs else "")
                     )
-                await reply("\n".join(lines))
+                rows = [[(b.name, f"/bot {b.name}")] for b in FLEET[:6]]
+                rows.append([("🔄 Refresh", "/status"), ("⬅️ Menu", "/menu")])
+                await reply("\n".join(lines), rows)
 
             elif cmd in ("pause", "resume"):
                 bots = find_bots(args[0]) if args else []
@@ -1114,10 +1414,23 @@ def register_control(control):
                 await reply("\n".join(lines))
 
             else:
-                await reply("unknown command — `/help`")
+                await reply("unknown command — `/help`", menu_main())
         except Exception as e:
             log.error(f"control error: {e}")
             await reply(f"error: `{e}`")
+
+    # MTProto path: taps arrive as CallbackQuery, not messages. The Bot API path
+    # folds them into its own poller, so this is Telethon-only.
+    if not isinstance(control, BotApiControl) and hasattr(events, "CallbackQuery"):
+        @control.on(events.CallbackQuery())
+        async def on_tap(cb):
+            try:
+                await cb.answer()
+            except Exception:
+                pass
+            data = cb.data.decode() if isinstance(cb.data, bytes) else str(cb.data or "")
+            if data.startswith("/"):
+                await on_cmd(_CBEvent(cb, data))
 
 
 # ---------------------------------------------------------------- Bot API fallback console
@@ -1157,10 +1470,11 @@ class BotApiControl:
     async def call(self, method, http_timeout=15, **params):
         return await asyncio.to_thread(self._post, method, params, http_timeout)
 
-    async def send(self, chat_id, text):
+    async def send(self, chat_id, text, buttons=None):
+        extra = {"reply_markup": to_botapi_markup(buttons)} if buttons else {}
         try:
             r = await self.call("sendMessage", chat_id=chat_id, text=text,
-                                parse_mode="Markdown", disable_web_page_preview="true")
+                                parse_mode="Markdown", disable_web_page_preview="true", **extra)
             if r.get("ok"):
                 return
             log.warning(f"control send rejected: {r.get('description')}")
@@ -1168,7 +1482,7 @@ class BotApiControl:
             log.warning(f"control send failed: {e}")
         try:   # markdown in the payload can trip the parser — resend as plain text
             await self.call("sendMessage", chat_id=chat_id, text=text,
-                            disable_web_page_preview="true")
+                            disable_web_page_preview="true", **extra)
         except Exception as e:
             log.error(f"control send failed (plain): {e}")
 
@@ -1184,16 +1498,30 @@ class BotApiControl:
         while True:
             try:
                 r = await self.call("getUpdates", http_timeout=70, offset=self.offset,
-                                    timeout=50, allowed_updates='["message"]')
+                                    timeout=50, allowed_updates='["message","callback_query"]')
             except Exception as e:
                 log.warning(f"getUpdates failed: {e}")
                 await asyncio.sleep(5)
                 continue
             for upd in r.get("result", []):
                 self.offset = upd["update_id"] + 1
-                msg = upd.get("message") or {}
-                text = msg.get("text") or ""
-                if not text.startswith("/") or not self.handler:
+                if not self.handler:
+                    continue
+                if "callback_query" in upd:          # a tapped button
+                    cb = upd["callback_query"]
+                    text = cb.get("data") or ""
+                    msg = {"chat": (cb.get("message") or {}).get("chat", {}),
+                           "from": cb.get("from", {})}
+                    try:
+                        await self.call("answerCallbackQuery", callback_query_id=cb["id"])
+                    except Exception:
+                        pass
+                    if not msg.get("chat"):
+                        continue
+                else:
+                    msg = upd.get("message") or {}
+                    text = msg.get("text") or ""
+                if not text.startswith("/"):
                     continue
                 try:
                     await self.handler(BotApiEvent(self, msg, text))
@@ -1210,8 +1538,21 @@ class BotApiEvent:
         self.raw_text = text
         self.sender_id = (msg.get("from") or {}).get("id")
 
-    async def reply(self, text, **_kw):
-        await self._ctrl.send(self._chat, text)
+    async def reply(self, text, buttons=None, **_kw):
+        await self._ctrl.send(self._chat, text, buttons)
+
+
+class _CBEvent:
+    """Telethon CallbackQuery wrapped to look like a message event, so a tapped
+    button runs the exact same handler as the typed command."""
+
+    def __init__(self, cb, text):
+        self._cb = cb
+        self.raw_text = text
+        self.sender_id = cb.sender_id
+
+    async def reply(self, text, **kw):
+        await self._cb.respond(text, **kw)
 
 
 def types_ns(**kw):
