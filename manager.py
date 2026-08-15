@@ -363,6 +363,51 @@ def dialog_ref(d):
     return f"@{u}" if u else d.id
 
 
+TME_RE = re.compile(r"^(?:https?://)?t\.me/(?:s/)?([A-Za-z0-9_]{4,})/?$", re.I)
+INVITE_RE = re.compile(r"^(?:https?://)?t\.me/(?:joinchat/|\+)", re.I)
+
+
+def normalize_source_ref(s):
+    """Apa pun yang diketik user -> '@username' atau chat id.
+
+    't.me/foo', 'https://t.me/foo', 'foo', '@foo' -> '@foo'
+    '-1001234567890'                              -> -1001234567890
+    """
+    s = str(s).strip().strip(",")
+    if not s:
+        return None
+    m = TME_RE.match(s)
+    if m:
+        return "@" + m.group(1)
+    if re.fullmatch(r"-?\d{5,}", s):
+        return int(s)
+    if s.startswith("@"):
+        return s
+    if re.fullmatch(r"[A-Za-z0-9_]{4,}", s):
+        return "@" + s
+    return s
+
+
+async def resolve_source_ref(b, ref):
+    """(ok, judul, alasan gagal) — dipakai sebelum nyimpen source dari @username."""
+    if INVITE_RE.match(str(ref)):
+        return False, None, ("link invite privat nggak bisa dipakai — join channelnya "
+                             f"dari akun `{b.name}` dulu, terus pilih lewat `/listchannels {b.name}`")
+    if getattr(b, "botmode", False):
+        if isinstance(ref, int):
+            return True, (b.known().get(ref) or {}).get("title", str(ref)), None
+        return False, None, (f"mode bot nggak bisa nyari `{ref}` sendiri — add "
+                             f"@{BOT_USERNAME or 'botnya'} ke channel itu, terus `/listchannels bot`")
+    if not isinstance(ref, int) and not str(ref).startswith("@"):
+        return False, None, "formatnya `@username` atau chat id (`-100…`)"
+    try:
+        ent = await b.client.get_entity(ref)
+    except Exception as e:
+        return False, None, (f"nggak ketemu ({type(e).__name__}) — pastiin akun `{b.name}` "
+                             f"udah join channelnya, dan usernamenya bener")
+    return True, getattr(ent, "title", None) or str(ref), None
+
+
 def dialog_matches(d, entry):
     ent = d.entity
     if isinstance(entry, int):
@@ -566,6 +611,11 @@ def render_picker(b, kind, dialogs, keyword=None, page=1, only=None):
     opts = pick_opts_suffix(page, only, keyword)
     rows.append([("✅ Pilih semua", f"/selall {b.name} {kind}{opts}"),
                  ("❌ Kosongin", f"/selnone {b.name} {kind}{opts}")])
+    if kind == "channel":
+        # 'Kosongin' cuma ngelepas yang lagi kelihatan; ini ngosongin semuanya,
+        # termasuk source @username yang nggak nongol di daftar joined.
+        rows.append([("➕ Tambah pakai @username", f"/addsource {b.name}"),
+                     ("🗑 Hapus SEMUA source", f"/clearsource {b.name}")])
     rows.append([("🔄 Refresh", listcmd + opts), ("✅ Selesai", f"/bot {b.name}")])
 
     n_on = len([d for d in dialogs if d.id in chosen])
@@ -713,6 +763,12 @@ def map_plain_text(raw):
     digits = re.sub(r"\D", "", raw)
     if PENDING_LOGINS and re.fullmatch(r"[\d\s\-]{4,20}", raw) and 4 <= len(digits) <= 8:
         return f"/code {list(PENDING_LOGINS)[-1]} {digits}"
+    # cuma @username / link t.me -> langsung jadiin source (kalau botnya cuma satu,
+    # jadi nggak ada yang perlu ditebak)
+    toks = raw.split()
+    if len(FLEET) == 1 and toks and len(toks) <= 10 and all(
+            re.fullmatch(r"@[A-Za-z0-9_]{4,}", t) or TME_RE.match(t) for t in toks):
+        return "/addsource " + FLEET[0].name + " " + " ".join(toks)
     return None
 
 
@@ -1056,7 +1112,9 @@ PANDUAN = (
     "`/addnumber ub1 +628xxxxxxxxx`\n"
     "`/code ub1 1 2 3 4 5`  ← tulis OTP dipisah spasi\n\n"
     "**2. Pilih channel sumber** — akun itu harus udah join\n"
-    "`/listchannels ub1` → `/addsource ub1 #1,2`\n\n"
+    "`/listchannels ub1` → `/addsource ub1 #1,2`\n"
+    "atau langsung: `/addsource ub1 @namachannel` (boleh sekaligus banyak)\n"
+    "`/clearsource ub1` — hapus semua source, mulai dari nol\n\n"
     "**3. Pilih group tujuan** — akun itu harus udah join & bisa kirim\n"
     "`/listgroups ub1` → `/allow ub1 #1,3`\n\n"
     "**4. Uji, baru live**\n"
@@ -1115,7 +1173,7 @@ def to_botapi_markup(rows):
 
 # Commands whose first argument is a bot name — see the auto-fill in on_cmd().
 BOT_ARG_CMDS = {
-    "bot", "listchannels", "addsource", "delsource", "sources", "listgroups",
+    "bot", "listchannels", "addsource", "delsource", "clearsource", "sources", "listgroups",
     "allow", "unallow", "groups", "mode", "titlefilter", "target", "batch", "cap",
     "quiet", "delay", "dryrun", "pause", "resume", "reload", "preview", "template",
     "attribution", "chains", "dedup", "dedupreset", "test", "testca", "broadcast",
@@ -1136,6 +1194,8 @@ HELP = (
     "**Pilih source channel**\n"
     "`/listchannels <bot> [keyword]` — channel yang di-join, bernomor\n"
     "`/addsource <bot> <#1,3 | @ch>` · `/delsource <bot> <#1,3 | @ch>`\n"
+    "`/addsource <bot> @ch1 @ch2` — tambah langsung pakai @username / link t.me\n"
+    "`/clearsource <bot>` — hapus SEMUA source sekaligus\n"
     "`/sources <bot>` — daftar source + tombol mute\n"
     "`/mute <bot> <id>` · `/unmute <bot> <id>` — matiin source sementara\n\n"
     "**Pilih target group/channel**\n"
@@ -2126,9 +2186,15 @@ def register_control(control):
                 if not bots:
                     return await reply("usage: `/sources <bot>`")
                 b = bots[0]
+                stale = len(b.cfg.get("source_channels", [])) - len(b.source_names)
                 if not b.source_names:
-                    return await reply(f"`{b.name}` belum punya source — "
-                                       f"`/listchannels {b.name}` buat milih")
+                    return await reply(
+                        f"`{b.name}` belum punya source aktif."
+                        + (f"\n⚠️ ada {stale} entry yang nggak bisa di-resolve — "
+                           f"`/clearsource {b.name}` buat bersihin." if stale > 0 else ""),
+                        [[("➕ Tambah pakai @username", f"/addsource {b.name}")],
+                         [("📋 Daftar channel joined", f"/listchannels {b.name}")],
+                         [("⬅️ Balik", f"/bot {b.name}")]])
                 lines = [f"**{b.name} — {len(b.source_names)} source**", ""]
                 rows = []
                 for cid, title in list(b.source_names.items())[:8]:
@@ -2136,19 +2202,33 @@ def register_control(control):
                     lines.append(f"{'🔇' if m else '📡'} {title} — `{cid}`")
                     rows.append([(f"{'🔊 Unmute' if m else '🔇 Mute'} {title[:14]}",
                                   f"/{'unmute' if m else 'mute'} {b.name} {cid}")])
+                if stale > 0:
+                    lines.append(f"\n⚠️ _{stale} entry nggak bisa di-resolve (belum join / "
+                                 f"username salah)_")
+                rows.append([("➕ Tambah pakai @username", f"/addsource {b.name}"),
+                             ("🗑 Hapus semua", f"/clearsource {b.name}")])
                 rows.append([("⬅️ Balik", f"/bot {b.name}")])
                 await reply("\n".join(lines), rows)
 
             elif cmd in ("addsource", "delsource"):
-                if len(args) < 2:
-                    return await reply(f"usage: `/{cmd} <bot> <#1,3 | @channel>`\n"
-                                       f"nomor `#n` ngikutin `/listchannels <bot>` terakhir")
-                bots = find_bots(args[0])
+                bots = find_bots(args[0]) if args else []
                 if not bots:
-                    return await reply("no such bot")
+                    return await reply("no such bot" if args else
+                                       f"usage: `/{cmd} <bot> <#1,3 | @channel>`")
                 b = bots[0]
                 rest = args[1:]
+                if not rest:
+                    return await reply(
+                        f"**Tambah source pakai @username**\n"
+                        f"Ketik: `/{cmd} {b.name} @namachannel`\n\n"
+                        f"Boleh sekaligus banyak: `/{cmd} {b.name} @alpha @beta @gamma`\n"
+                        f"Link `t.me/...` sama chat id `-100…` juga kebaca.\n\n"
+                        f"_Channel privat tanpa username: join dulu dari akun `{b.name}`, "
+                        f"terus pilih lewat_ `/listchannels {b.name}`",
+                        [[("📋 Daftar channel joined", f"/listchannels {b.name}")],
+                         [("⬅️ Balik", f"/bot {b.name}")]])
 
+                resolved = {}
                 if is_index_arg(rest):
                     if not b.listing["channel"]:
                         return await reply(f"jalanin `/listchannels {b.name}` dulu biar ada nomornya")
@@ -2159,13 +2239,27 @@ def register_control(control):
                     entries = [d.id if getattr(b, "botmode", False) else dialog_ref(d)
                                for d in picked]
                 else:
-                    entries = [rest[0]]
+                    refs = [r for r in (normalize_source_ref(x) for x in rest) if r]
+                    if cmd == "delsource":
+                        entries = refs
+                    else:
+                        entries, errs = [], []
+                        for r in refs:
+                            ok, title, why = await resolve_source_ref(b, r)
+                            if ok:
+                                entries.append(r)
+                                resolved[str(r)] = title
+                            else:
+                                errs.append(f"❌ `{r}` — {why}")
+                        if errs and not entries:
+                            return await reply("\n".join(errs),
+                                               [[("📋 Daftar channel joined", f"/listchannels {b.name}")]])
 
                 srcs = b.cfg.setdefault("source_channels", [])
                 touched = []
                 for e in entries:
                     if cmd == "addsource":
-                        if e not in srcs:
+                        if not any(str(x) == str(e) for x in srcs):
                             srcs.append(e)
                             touched.append(str(e))
                     else:
@@ -2174,10 +2268,36 @@ def register_control(control):
                         if len(srcs) != before:
                             touched.append(str(e))
                 await b.refresh_sources()
+                await b.refresh_targets()
                 save_fleet()
                 verb = "added" if cmd == "addsource" else "removed"
-                await reply(f"{verb}: {', '.join(f'`{t}`' for t in touched) or '(nothing)'}\n"
-                            f"`{b.name}` sekarang {len(b.source_ids)} source aktif")
+                shown = ", ".join(f"`{t}`" + (f" ({resolved[t]})" if resolved.get(t) else "")
+                                  for t in touched) or "(nothing)"
+                await reply(f"{verb}: {shown}\n"
+                            f"`{b.name}` sekarang {len(b.source_ids)} source aktif",
+                            [[("📡 Lihat source", f"/sources {b.name}"),
+                              ("📋 Pilih lagi", f"/listchannels {b.name}")]])
+
+            elif cmd == "clearsource":
+                bots = find_bots(args[0]) if args else []
+                if not bots:
+                    return await reply("usage: `/clearsource <bot>` — hapus SEMUA source channel")
+                b = bots[0]
+                n = len(b.cfg.get("source_channels", []))
+                if not n:
+                    return await reply(f"`{b.name}` emang lagi nggak punya source",
+                                       [[("📋 Pilih source", f"/listchannels {b.name}")]])
+                b.cfg["source_channels"] = []
+                b.cfg.pop("muted_sources", None)
+                await b.refresh_sources()
+                await b.refresh_targets()
+                save_fleet()
+                await reply(f"🗑 **{n} source dihapus** dari `{b.name}` — sekarang kosong.\n"
+                            f"Tambah lagi pakai `/addsource {b.name} @namachannel` "
+                            f"atau pilih dari daftar.",
+                            [[("➕ Tambah pakai @username", f"/addsource {b.name}")],
+                             [("📋 Daftar channel joined", f"/listchannels {b.name}")],
+                             [("⬅️ Balik", f"/bot {b.name}")]])
 
             elif cmd == "mode":
                 if len(args) < 2 or args[1] not in ("allowlist", "blocklist", "all"):
@@ -2340,6 +2460,7 @@ BOT_COMMANDS = [
     ("listchannels", "Pilih source channel — /listchannels <bot>"),
     ("addsource", "Tambah source — /addsource <bot> #1,3"),
     ("delsource", "Hapus source — /delsource <bot> #1"),
+    ("clearsource", "Hapus SEMUA source — /clearsource <bot>"),
     ("sources", "Daftar source + tombol mute"),
     ("mute", "Matiin source sementara — /mute <bot> <id>"),
     ("unmute", "Nyalain lagi — /unmute <bot> <id>"),

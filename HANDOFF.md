@@ -111,7 +111,9 @@ Userbot baru selalu lahir **aman**: `dry_run: true`, 0 source, allowlist kosong 
 | Command | Fungsi |
 |---|---|
 | `/listchannels <bot> [keyword]` | Channel yang di-join akun itu, bernomor. `keyword` nyaring by judul/@username. ✅ = udah jadi source |
-| `/addsource <bot> <#1,3>` `/delsource <bot> <#1,3>` | Pilih/buang source pakai nomor dari listing barusan (`@channel` tetep bisa) |
+| `/addsource <bot> <#1,3>` `/delsource <bot> <#1,3>` | Pilih/buang source pakai nomor dari listing barusan |
+| `/addsource <bot> @ch1 @ch2` | Tambah source langsung pakai @username atau link `t.me/...` — boleh beberapa sekaligus. Kalau cuma ada 1 userbot, cukup kirim `@namachannel` doang tanpa command. Username di-resolve dulu; kalau akunnya belum join, ditolak dengan alasan yang jelas |
+| `/clearsource <bot>` | Hapus **semua** source sekaligus, termasuk entry yang udah nggak bisa di-resolve. Tombolnya ada di picker source & `/sources` |
 | `/target <bot> <group\|channel\|both>` | Jenis chat yang boleh jadi target. Default `group`. Buat channel, akun userbot harus **admin dengan hak post** |
 | `/listgroups <bot> [keyword]` | Target yang di-join, bernomor — isinya ngikutin `/target`. ✅ = udah jadi target |
 | `/allow <bot> <#1,3>` `/unallow <bot> <#1,3>` | Pilih/buang target group pakai nomor (`@grp`/id/substring tetep bisa) |
