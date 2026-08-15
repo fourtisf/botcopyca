@@ -921,10 +921,23 @@ def screen_start():
         "━━━━━━━━━━━━━━━━━━\n"
         f"➡️ **Langkah lo sekarang: {judul}**\n{detail}"
     )
-    return text, [
-        [(blabel, bcmd), ("📖 Panduan", "/panduan")],
-        [("📋 Menu", "/menu"), ("❓ Semua command", "/help")],
+    rows = [
+        [(blabel, bcmd)],                                    # langkah berikutnya, selebar layar
+        [("📊 Status", "/status"), ("📈 Stats", "/stats")],
+        [("🤖 Userbot", "/bots"),
+         ("➕ Tambah akun", "/addnumber") if CREDS_OK else ("📋 Chat bot", "/chats")],
+        [("🛡 Anti-spam", "/antispam"), ("📜 Riwayat", "/last")],
+        [("🏆 Top source", "/top"), ("🩺 Info", "/version")],
+        [("📖 Panduan", "/panduan"), ("❓ Semua command", "/help")],
+        [("📋 Menu", "/menu"), ("🏓 Ping", "/ping")],
     ]
+    seen, out = {bcmd}, [rows[0]]                            # buang tombol dobel
+    for row in rows[1:]:
+        keep = [(l, c) for l, c in row if c not in seen]
+        seen.update(c for _, c in keep)
+        if keep:
+            out.append(keep)
+    return text, out
 
 
 PANDUAN = (
