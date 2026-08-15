@@ -518,7 +518,7 @@ def parse_pick_opts(tokens):
     for a in tokens:
         if re.fullmatch(r"p\d+", a):
             page = max(1, int(a[1:]))
-        elif a.startswith("only:") and a[5:] in ("group", "channel"):
+        elif a.startswith("only:") and a[5:] in ("group", "channel", "all"):
             only = a[5:]
         else:
             words.append(a)
@@ -546,14 +546,14 @@ def render_picker(b, kind, dialogs, keyword=None, page=1, only=None):
         rows.append([(f"{'✅' if d.id in chosen else '▫️'} {badge}{title}",
                       f"/{tog} {b.name} {i}" + pick_opts_suffix(page, only, keyword))])
 
-    if kind == "group":      # saring jenis — channel doang / group doang / semua
+    if kind == "group":      # default group murni; channel & campuran opsional
         rows.append([
-            (("👥 Group" + (" ✓" if only == "group" else "")),
+            (("👥 Group" + (" ✓" if only in (None, "group") else "")),
              listcmd + pick_opts_suffix(1, "group", keyword)),
             (("📢 Channel" + (" ✓" if only == "channel" else "")),
              listcmd + pick_opts_suffix(1, "channel", keyword)),
-            (("🔀 Semua" + (" ✓" if not only else "")),
-             listcmd + pick_opts_suffix(1, None, keyword)),
+            (("🔀 Semua" + (" ✓" if only == "all" else "")),
+             listcmd + pick_opts_suffix(1, "all", keyword)),
         ])
     if pages > 1:
         nav = []
@@ -1026,7 +1026,7 @@ def screen_start():
     if FLEET:                                                # pilih source & target langsung
         n = FLEET[0].name
         rows.append([("📡 Channel sumber", f"/listchannels {n}"),
-                     ("🎯 Group / channel tujuan", f"/listgroups {n}")])
+                     ("🎯 Group tujuan", f"/listgroups {n}")])
     rows += [
         [("📊 Status", "/status"), ("📈 Stats", "/stats")],
         [("🤖 Userbot", "/bots"),
@@ -1852,10 +1852,12 @@ def register_control(control):
                 page, only, keyword = parse_pick_opts(args[1:])
                 dialogs = (b.learned_dialogs(kind, keyword) if getattr(b, "botmode", False)
                            else await collect_dialogs(b, kind, keyword))
-                if only == "group":
-                    dialogs = [d for d in dialogs if d.is_group]
-                elif only == "channel":
-                    dialogs = [d for d in dialogs if d.is_channel and not d.is_group]
+                if kind == "group":
+                    # target defaultnya group murni; channel cuma kalau diminta
+                    if only in (None, "group"):
+                        dialogs = [d for d in dialogs if d.is_group]
+                    elif only == "channel":
+                        dialogs = [d for d in dialogs if d.is_channel and not d.is_group]
                 if getattr(b, "botmode", False) and not dialogs and not b.known():
                     return await reply(
                         "Bot ini belum di-add ke chat mana pun.\n\n"
