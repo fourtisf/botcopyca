@@ -1881,6 +1881,85 @@ def register_control(control):
 
 # ---------------------------------------------------------------- Bot API fallback console
 
+def botapi_post(token, method, params, timeout=15):
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = urllib.parse.urlencode(params).encode()
+    try:
+        with urllib.request.urlopen(url, data=data, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        # Telegram explains itself in the body ("Conflict: terminated by other
+        # getUpdates request", "Forbidden: bot was blocked", …) — surface that
+        # instead of a bare "HTTP Error 409".
+        try:
+            return json.loads(e.read().decode())
+        except Exception:
+            return {"ok": False, "description": f"HTTP {e.code}"}
+
+
+# Telegram only shows the "/" autocomplete for commands registered with
+# setMyCommands. Without this the console works but looks empty in the client.
+BOT_COMMANDS = [
+    ("menu", "Menu utama (tombol)"),
+    ("status", "Status semua bot"),
+    ("ping", "Ukur delay bot"),
+    ("chats", "Chat yang kebaca bot"),
+    ("here", "Daftarin chat ini (ketik di dalam group)"),
+    ("bots", "Daftar userbot"),
+    ("listchannels", "Pilih source channel — /listchannels <bot>"),
+    ("addsource", "Tambah source — /addsource <bot> #1,3"),
+    ("delsource", "Hapus source — /delsource <bot> #1"),
+    ("sources", "Daftar source + tombol mute"),
+    ("mute", "Matiin source sementara — /mute <bot> <id>"),
+    ("unmute", "Nyalain lagi — /unmute <bot> <id>"),
+    ("listgroups", "Pilih target — /listgroups <bot>"),
+    ("allow", "Tambah target — /allow <bot> #1,3"),
+    ("unallow", "Hapus target — /unallow <bot> #1"),
+    ("groups", "Target yang kepilih"),
+    ("target", "Jenis target — /target <bot> group|channel|both"),
+    ("mode", "Mode filter — /mode <bot> allowlist|blocklist|all"),
+    ("titlefilter", "Saring target by judul"),
+    ("testca", "Suntik CA palsu buat ngetes — /testca <bot>"),
+    ("test", "Kirim pesan tes ke semua target"),
+    ("broadcast", "Kirim pesan manual — /broadcast <bot> <teks>"),
+    ("preview", "Contoh pesan yang bakal dikirim"),
+    ("template", "Format pesan sendiri"),
+    ("dryrun", "Preview-only on/off — /dryrun <bot> off"),
+    ("batch", "Kumpulin CA jadi 1 recap — /batch <bot> <menit>"),
+    ("cap", "Max pesan per group per hari"),
+    ("quiet", "Jam tenang — /quiet <bot> 23:00-07:00"),
+    ("delay", "Jeda antar group"),
+    ("pause", "Stop kirim sementara"),
+    ("resume", "Lanjut kirim"),
+    ("reload", "Re-resolve source & target"),
+    ("last", "CA terakhir yang direlay"),
+    ("top", "Source paling produktif"),
+    ("find", "Cari CA — /find <ca>"),
+    ("stats", "Counter relay"),
+    ("log", "Log terakhir — /log 10"),
+    ("version", "Mode, uptime, jumlah bot"),
+    ("addnumber", "Tambah userbot (butuh api_id)"),
+    ("help", "Semua command"),
+]
+
+
+async def setup_bot_commands(control):
+    """Register the command list so Telegram's "/" menu is populated."""
+    payload = json.dumps([{"command": c, "description": d} for c, d in BOT_COMMANDS])
+    try:
+        if isinstance(control, BotApiControl):
+            r = await control.call("setMyCommands", commands=payload)
+        else:
+            r = await asyncio.to_thread(botapi_post, CONTROL_BOT_TOKEN,
+                                        "setMyCommands", {"commands": payload}, 15)
+        if r.get("ok"):
+            log.info(f"{len(BOT_COMMANDS)} command kedaftar di menu Telegram")
+        else:
+            log.warning(f"setMyCommands ditolak: {r.get('description')}")
+    except Exception as e:
+        log.warning(f"setMyCommands gagal: {e}")
+
+
 class BotApiControl:
     """Control bot over the plain HTTP Bot API — token only, no api_id.
 
@@ -1908,19 +1987,7 @@ class BotApiControl:
 
     # --- http ---------------------------------------------------------------
     def _post(self, method, params, timeout):
-        url = f"https://api.telegram.org/bot{self.token}/{method}"
-        data = urllib.parse.urlencode(params).encode()
-        try:
-            with urllib.request.urlopen(url, data=data, timeout=timeout) as r:
-                return json.loads(r.read().decode())
-        except urllib.error.HTTPError as e:
-            # Telegram explains itself in the body ("Conflict: terminated by other
-            # getUpdates request", "Forbidden: bot was blocked", …) — surface that
-            # instead of a bare "HTTP Error 409".
-            try:
-                return json.loads(e.read().decode())
-            except Exception:
-                return {"ok": False, "description": f"HTTP {e.code}"}
+        return botapi_post(self.token, method, params, timeout)
 
     async def call(self, method, http_timeout=15, **params):
         return await asyncio.to_thread(self._post, method, params, http_timeout)
@@ -2123,6 +2190,7 @@ async def main():
         me = await control.get_me()
         globals()["BOT_USERNAME"] = me.username or ""
         log.info(f"control bot live: @{me.username} (admins: {sorted(ADMIN_IDS)})")
+        asyncio.create_task(setup_bot_commands(control))   # background: never blocks boot
         if isinstance(control, BotApiControl):
             # no api_id: the bot token itself can still relay, for chats the bot is in
             await attach_bot_relay(control)
