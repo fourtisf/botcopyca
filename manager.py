@@ -626,7 +626,10 @@ def render_picker(b, kind, dialogs, keyword=None, page=1, only=None):
     head = (f"**Pilih {what}** — `{b.name}`"
             + (f" · filter `{keyword}`" if keyword else "")
             + (f" · {only} doang" if only else "")
-            + f"\n**{n_on}** dari {len(dialogs)} kepilih. Tap buat pilih / batal.")
+            + f"\n**{n_on}** dari {len(dialogs)} kepilih. Tap buat pilih / batal.\n"
+            + f"_Daftar di bawah = semua {'channel' if kind == 'channel' else 'chat'} yang "
+              f"udah di-join akun `{b.name}`, bukan daftar {what}. "
+              f"Cuma yang ✅ yang kepake._")
     if pages > 1:
         head += f"\n_halaman {page} dari {pages}_"
     if kind == "group" and n_on > 15:
@@ -2297,8 +2300,13 @@ def register_control(control):
                 b = bots[0]
                 n = len(b.cfg.get("source_channels", []))
                 if not n:
-                    return await reply(f"`{b.name}` emang lagi nggak punya source",
-                                       [[("📋 Pilih source", f"/listchannels {b.name}")]])
+                    return await reply(
+                        f"✅ Source `{b.name}` **udah kosong** — 0 channel dipantau, "
+                        f"nggak ada yang perlu dihapus.\n\n"
+                        f"_Daftar panjang di picker itu channel yang udah di-join akunnya — "
+                        f"emang tetep kelihatan. Yang ilang cuma tanda ✅._",
+                        [[("➕ Tambah pakai @username", f"/addsource {b.name}")],
+                         [("📋 Daftar channel joined", f"/listchannels {b.name}")]])
                 b.cfg["source_channels"] = []
                 b.cfg.pop("muted_sources", None)
                 await b.refresh_sources()
