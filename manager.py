@@ -195,6 +195,21 @@ def bump_send(bot: str, gid: int):
     db.commit()
 
 
+def ago(ts):
+    d = max(0, int(time.time() - ts))
+    if d < 60:
+        return f"{d}d"
+    if d < 3600:
+        return f"{d // 60}m"
+    if d < 86400:
+        return f"{d // 3600}j"
+    return f"{d // 86400}h"
+
+
+def is_muted(cfg, cid) -> bool:
+    return cid in {int(x) for x in cfg.get("muted_sources", []) if str(x).lstrip("-").isdigit()}
+
+
 def cap_reached(cfg, gid: int) -> bool:
     cap = cfg.get("max_per_day_per_group", 0) or 0
     return cap > 0 and sends_today(cfg["name"], gid) >= cap
@@ -536,7 +551,7 @@ def make_handler(bot):
     async def handler(event):
         try:
             pid = utils.get_peer_id(await event.get_chat())
-            if pid not in bot.source_ids:
+            if pid not in bot.source_ids or is_muted(bot.cfg, pid):
                 return
             src = bot.source_names.get(pid, "unknown")
             for ca, chain in extract_cas(get_all_text(event.message), bot.cfg.get("chains", ["sol", "evm"])):
@@ -708,7 +723,7 @@ async def on_bot_message(chat, msg):
         return
     bot = bots[0]
     cid = chat.get("id")
-    if cid not in bot.source_ids:
+    if cid not in bot.source_ids or is_muted(bot.cfg, cid):
         return
     src = bot.source_names.get(cid, chat.get("title") or str(cid))
     for ca, chain in extract_cas(botapi_text(msg), bot.cfg.get("chains", ["sol", "evm"])):
@@ -832,8 +847,8 @@ def menu_main():
     return [
         [("📊 Status", "/status"), ("📈 Stats", "/stats")],
         [("🤖 Userbot", "/bots"), ("📋 Chat bot", "/chats")],
-        [("🛡 Anti-spam", "/antispam"), ("❓ Command", "/help")],
-        [("🔄 Refresh", "/menu"), ("🩺 Info", "/version")],
+        [("🛡 Anti-spam", "/antispam"), ("📜 Riwayat", "/last")],
+        [("❓ Command", "/help"), ("🩺 Info", "/version")],
     ]
 
 
@@ -843,8 +858,9 @@ def menu_bot(b):
         [("▶️ Resume" if b.paused else "⏸ Pause", f"/{'resume' if b.paused else 'pause'} {b.name}"),
          ("🚀 Go live" if dry else "🧪 Dry-run", f"/dryrun {b.name} {'off' if dry else 'on'}")],
         [("📡 Source", f"/listchannels {b.name}"), ("🎯 Target", f"/listgroups {b.name}")],
-        [("👁 Preview", f"/preview {b.name}"), ("🔧 Test kirim", f"/test {b.name}")],
-        [("🔄 Reload", f"/reload {b.name}"), ("⬅️ Balik", "/bots")],
+        [("👁 Preview", f"/preview {b.name}"), ("🧪 Test CA", f"/testca {b.name}")],
+        [("🔧 Test kirim", f"/test {b.name}"), ("🔄 Reload", f"/reload {b.name}")],
+        [("📜 Riwayat", "/last"), ("⬅️ Balik", "/bots")],
     ]
 
 
@@ -871,12 +887,14 @@ HELP = (
     "**Pilih source channel**\n"
     "`/listchannels <bot> [keyword]` — channel yang di-join, bernomor\n"
     "`/addsource <bot> <#1,3 | @ch>` · `/delsource <bot> <#1,3 | @ch>`\n"
-    "`/sources <bot>`\n\n"
+    "`/sources <bot>` — daftar source + tombol mute\n"
+    "`/mute <bot> <id>` · `/unmute <bot> <id>` — matiin source sementara\n\n"
     "**Pilih target group/channel**\n"
     "`/target <bot> <group|channel|both>` — jenis chat yang boleh jadi target\n"
     "`/listgroups <bot> [keyword]` — target yang di-join, bernomor\n"
     "`/allow <bot> <#1,3 | @grp|id|substr>` · `/unallow <bot> <#1,3 | entry>`\n"
     "`/mode <bot> <allowlist|blocklist|all>`\n"
+    "`/block <bot> <#1,3>` · `/unblock <bot> <#1,3>`\n"
     "`/titlefilter <bot> <kata|clear>` — saring by judul\n"
     "`/groups <bot>` — target yang kepilih sekarang\n\n"
     "**Anti-spam**\n"
@@ -895,12 +913,20 @@ HELP = (
     "`/dryrun <bot|all> <on|off>`\n"
     "`/reload <bot|all>` — re-resolve habis join/leave\n"
     "`/test <bot>` — kirim pesan tes ke semua target (cek izin)\n"
+    "`/testca <bot> [ca]` — suntik CA palsu, uji pipeline relay\n"
+    "`/broadcast <bot> <teks>` — kirim pesan manual ke semua target\n"
     "`/dedupreset <bot>` — lupain CA yang udah pernah dipost\n\n"
+    "**Riwayat**\n"
+    "`/last [n]` — CA terakhir yang direlay\n"
+    "`/top` — source paling produktif\n"
+    "`/find <ca>` — CA ini udah pernah dipost belum\n"
+    "`/resetstats <bot|all>` — nolin counter\n\n"
     "**Sistem**\n"
     "`/ping` — ukur delay bot\n"
     "`/version` — mode, uptime, jumlah bot\n"
     "`/log [n]` — log terakhir\n"
     "`/admins` · `/addadmin <id>` · `/deladmin <id>`\n"
+    "`/restart` — restart proses (pm2 nyalain lagi)\n"
 )
 
 
@@ -1157,6 +1183,180 @@ def register_control(control):
                 await reply("\n".join(out), [[("⬅️ Balik", f"/bot {b.name}")]])
 
             # ---------------------------------------------------- sistem
+            # ---------------------------------------------------- uji & kirim manual
+            elif cmd == "testca":
+                bots = find_bots(args[0]) if args else []
+                if not bots:
+                    return await reply("usage: `/testca <bot> [ca]`\n"
+                                       "nyuntik CA palsu ke pipeline — lewat filter, dedup, "
+                                       "batch, dry-run, semuanya. Buat mastiin relay jalan "
+                                       "tanpa nunggu call beneran.")
+                b = bots[0]
+                ca = args[1] if len(args) > 1 else "So11111111111111111111111111111111111111112"
+                chain = "evm" if ca.lower().startswith("0x") else "sol"
+                if not b.targets:
+                    return await reply(f"`{b.name}` belum punya target — `/listgroups {b.name}` dulu")
+                if ca in b.inflight or already_posted(b.name, ca, b.cfg.get("dedup_hours", 0)):
+                    return await reply(f"CA itu udah pernah dipost, bakal ke-skip dedup.\n"
+                                       f"Pakai CA lain, atau `/dedupreset {b.name}` dulu.")
+                b.inflight.add(ca)
+                await b.queue.put((ca, chain, "TEST"))
+                dry = b.cfg.get("send_filter", {}).get("dry_run", False)
+                await reply(f"🧪 CA tes dimasukin ke antrean `{b.name}`\n"
+                            f"target: {len(b.targets)} chat · "
+                            + ("**dry-run** — cuma muncul di log, nggak beneran dikirim"
+                               if dry else "**live** — bakal beneran kekirim")
+                            + f"\n\ncek: `/log 10`",
+                            [[("📜 Log", "/log 10"), ("📊 Status", "/status")]])
+
+            elif cmd == "broadcast":
+                if len(args) < 2:
+                    return await reply("usage: `/broadcast <bot> <teks>` — kirim pesan manual "
+                                       "ke semua target")
+                bots = find_bots(args[0])
+                if not bots:
+                    return await reply("no such bot")
+                b = bots[0]
+                if not b.targets:
+                    return await reply(f"`{b.name}` belum punya target")
+                text = " ".join(args[1:]).replace("\\n", "\n")
+                await reply(f"ngirim ke {len(b.targets)} chat…")
+                ok, fail = 0, []
+                for d in b.targets:
+                    try:
+                        await b.client.send_message(d.entity, text, parse_mode="md", link_preview=False)
+                        ok += 1
+                    except Exception as e:
+                        fail.append(f"{dialog_name(d)} — {type(e).__name__}")
+                    await asyncio.sleep(b.cfg.get("delay_between_groups_sec", 5))
+                out = [f"📢 broadcast `{b.name}`: {ok} sukses"]
+                if fail:
+                    out += [f"❌ {x}" for x in fail]
+                await reply("\n".join(out))
+
+            # ---------------------------------------------------- riwayat & statistik
+            elif cmd == "last":
+                n = 10
+                if args and args[0].isdigit():
+                    n = max(1, min(30, int(args[0])))
+                rows = db.execute(
+                    "SELECT ca, chain, source, first_seen, bot FROM posted "
+                    "ORDER BY first_seen DESC LIMIT ?", (n,)).fetchall()
+                if not rows:
+                    return await reply("belum ada CA yang direlay")
+                lines = [f"**{len(rows)} CA terakhir**", ""]
+                for ca, chain, source, ts, bot_name in rows:
+                    lines.append(f"`{ca[:12]}…` {chain.upper()} · {source} · {ago(ts)} lalu")
+                await reply("\n".join(lines), [[("🔄 Refresh", f"/last {n}"), ("⬅️ Menu", "/menu")]])
+
+            elif cmd == "top":
+                rows = db.execute(
+                    "SELECT source, COUNT(*) c FROM posted GROUP BY source ORDER BY c DESC LIMIT 15"
+                ).fetchall()
+                if not rows:
+                    return await reply("belum ada data — belum ada CA yang direlay")
+                total = sum(c for _, c in rows)
+                lines = [f"**Source paling produktif** ({total} CA total)", ""]
+                for i, (source, c) in enumerate(rows, start=1):
+                    bar = "█" * max(1, round(c / rows[0][1] * 10))
+                    lines.append(f"`{i:>2}` {bar} **{c}** — {source}")
+                lines.append("\n_source yang sepi tinggal `/mute` atau `/delsource`_")
+                await reply("\n".join(lines))
+
+            elif cmd == "find":
+                if not args:
+                    return await reply("usage: `/find <ca>` — cek CA ini udah pernah dipost apa belum "
+                                       "(boleh sebagian aja)")
+                q = args[0]
+                rows = db.execute(
+                    "SELECT bot, ca, chain, source, first_seen FROM posted WHERE ca LIKE ? LIMIT 10",
+                    (q + "%",)).fetchall()
+                if not rows:
+                    rows = db.execute(
+                        "SELECT bot, ca, chain, source, first_seen FROM posted WHERE ca LIKE ? LIMIT 10",
+                        ("%" + q + "%",)).fetchall()
+                if not rows:
+                    return await reply(f"`{q}` belum pernah dipost — kalau muncul di source, bakal direlay")
+                lines = ["**Ketemu**", ""]
+                for bot_name, ca, chain, source, ts in rows:
+                    lines.append(f"`{ca}`\n{chain.upper()} · dari {source} · {ago(ts)} lalu · bot `{bot_name}`")
+                await reply("\n".join(lines))
+
+            elif cmd == "resetstats":
+                bots = find_bots(args[0]) if args else FLEET
+                if not bots:
+                    return await reply("usage: `/resetstats <bot|all>`")
+                for b in bots:
+                    for k in b.counters:
+                        b.counters[k] = 0
+                await reply("counter direset: " + ", ".join(f"`{b.name}`" for b in bots))
+
+            # ---------------------------------------------------- mute source
+            elif cmd in ("mute", "unmute"):
+                if len(args) < 2:
+                    return await reply(f"usage: `/{cmd} <bot> <id source>`\n"
+                                       f"`/sources <bot>` buat liat daftarnya + tombol")
+                bots = find_bots(args[0])
+                if not bots:
+                    return await reply("no such bot")
+                b = bots[0]
+                raw = args[1]
+                if not raw.lstrip("-").isdigit():
+                    return await reply("pakai id numerik — liat `/sources`")
+                cid = int(raw)
+                muted = b.cfg.setdefault("muted_sources", [])
+                if cmd == "mute":
+                    if cid not in muted:
+                        muted.append(cid)
+                else:
+                    b.cfg["muted_sources"] = [x for x in muted if int(x) != cid]
+                save_fleet()
+                name = b.source_names.get(cid, str(cid))
+                await reply(f"{'🔇 di-mute' if cmd == 'mute' else '🔊 di-unmute'}: {name}\n"
+                            f"_source-nya tetep kedaftar, cuma pesannya diabaikan_",
+                            [[("📡 Sources", f"/sources {b.name}")]])
+
+            # ---------------------------------------------------- blocklist
+            elif cmd in ("block", "unblock"):
+                if len(args) < 2:
+                    return await reply(f"usage: `/{cmd} <bot> <#1,3 | @grp|id>` — kepake pas "
+                                       f"`/mode <bot> blocklist`")
+                bots = find_bots(args[0])
+                if not bots:
+                    return await reply("no such bot")
+                b = bots[0]
+                rest = args[1:]
+                if is_index_arg(rest):
+                    if not b.listing["group"]:
+                        return await reply(f"jalanin `/listgroups {b.name}` dulu")
+                    picked, bad = parse_indices(rest, b.listing["group"])
+                    if bad:
+                        return await reply(f"nomor nggak valid: {', '.join(bad)}")
+                    vals = [d.id for d in picked]
+                else:
+                    e = " ".join(rest)
+                    vals = [int(e) if e.lstrip("-").isdigit() else e]
+                fil = b.cfg.setdefault("send_filter", {})
+                bl = fil.setdefault("blocklist", [])
+                for v in vals:
+                    if cmd == "block":
+                        if v not in bl:
+                            bl.append(v)
+                    else:
+                        bl[:] = [x for x in bl if str(x) != str(v)]
+                await b.refresh_targets()
+                save_fleet()
+                note = "" if fil.get("mode") == "blocklist" else (
+                    f"\n⚠️ mode `{b.name}` sekarang `{fil.get('mode', 'allowlist')}` — "
+                    f"blocklist kesimpen tapi belum ngefek")
+                await reply(f"`{b.name}` blocklist: {len(bl)} entri → {len(b.targets)} target" + note)
+
+            elif cmd == "restart":
+                await reply("♻️ restart… bakal balik sendiri dalam beberapa detik "
+                            "(pm2 yang ngidupin lagi).")
+                log.warning("restart diminta lewat /restart")
+                asyncio.get_running_loop().call_later(1.0, os._exit, 0)
+
             elif cmd == "ping":
                 t0 = time.time()
                 sent = getattr(event, "date", None)
@@ -1527,8 +1727,17 @@ def register_control(control):
                     return await reply("usage: `/sources <bot>`")
                 b = bots[0]
                 if not b.source_names:
-                    return await reply(f"`{b.name}` has no sources")
-                await reply(f"**{b.name} sources**\n" + "\n".join(f"• {v}" for v in b.source_names.values()))
+                    return await reply(f"`{b.name}` belum punya source — "
+                                       f"`/listchannels {b.name}` buat milih")
+                lines = [f"**{b.name} — {len(b.source_names)} source**", ""]
+                rows = []
+                for cid, title in list(b.source_names.items())[:8]:
+                    m = is_muted(b.cfg, cid)
+                    lines.append(f"{'🔇' if m else '📡'} {title} — `{cid}`")
+                    rows.append([(f"{'🔊 Unmute' if m else '🔇 Mute'} {title[:14]}",
+                                  f"/{'unmute' if m else 'mute'} {b.name} {cid}")])
+                rows.append([("⬅️ Balik", f"/bot {b.name}")])
+                await reply("\n".join(lines), rows)
 
             elif cmd in ("addsource", "delsource"):
                 if len(args) < 2:
