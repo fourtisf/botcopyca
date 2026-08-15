@@ -788,6 +788,20 @@ async def detach_userbot(bot):
 
 
 PENDING_LOGINS = {}   # bot name -> {client, phone, hash, session}
+LOGIN_LOCK = set()    # nomor yang lagi dibukain client — cegah dua client sekaligus
+
+
+def same_phone(a, b):
+    """'+62 821-6098' vs '628216098' -> sama. None nggak pernah sama."""
+    if not a or not b:
+        return False
+    return re.sub(r"\D", "", str(a)) == re.sub(r"\D", "", str(b))
+
+
+def session_for_phone(phone):
+    """Nama file session ngikut nomor, bukan label — biar label yang dipakai
+    ulang (`ub1`) nggak nyangkut ke akun lama yang udah dihapus."""
+    return "session_acc_" + re.sub(r"\D", "", str(phone))
 
 # Typing "/addnumber ub1 +62…" is a lot to ask. In a private chat with an admin,
 # a bare phone number starts the flow and bare digits answer the OTP prompt.
@@ -1351,9 +1365,12 @@ def register_control(control):
             b = await attach_userbot(cfg, client)
             save_fleet()
             log.info(f"[{name}] added live as @{me.username} ({me.first_name})")
+            reused = p.get("hash") is None      # session lama kepakai, OTP dilewat
             await reply(
                 f"✅ `{name}` login sebagai **{me.first_name}** (@{me.username})\n"
-                f"state: 🧪 dry-run · 0 source · 0 target group\n\n"
+                + (f"_Akun ini udah pernah login di server ini, jadi OTP dilewat. "
+                   f"Bukan lo yang nambah? `/delbot {name}`._\n" if reused else "")
+                + f"state: 🧪 dry-run · 0 source · 0 target group\n\n"
                 f"lanjut:\n"
                 f"1. `/listchannels {name}` → `/addsource {name} #1,2`\n"
                 f"2. `/listgroups {name}` → `/allow {name} #1,2`\n"
@@ -1942,27 +1959,60 @@ def register_control(control):
                     return await reply(f"nama `{name}` udah kepake")
                 if not phone.startswith("+") or len(phone) < 8:
                     return await reply("nomor harus format internasional, contoh `+628123456789`")
-                session = f"session_{name}"
-                client = TelegramClient(str(BASE / session), API_ID, API_HASH)
-                await client.connect()
-                if await client.is_user_authorized():
-                    PENDING_LOGINS[name] = {"client": client, "phone": phone, "hash": None, "session": session}
-                    return await finish_login(name)
+
+                dup = [b for b in FLEET if same_phone((b.cfg.get("account") or {}).get("phone"), phone)]
+                if dup:
+                    return await reply(f"nomor itu udah kepasang sebagai `{dup[0].name}`",
+                                       [[("⚙️ Buka " + dup[0].name, f"/bot {dup[0].name}")]])
+                # dua pesan nomor yang sama beruntun bakal buka dua client ke file
+                # session yang sama -> sqlite "database is locked". Kunci dulu.
+                if phone in LOGIN_LOCK or any(same_phone(p.get("phone"), phone)
+                                              for p in PENDING_LOGINS.values()):
+                    return await reply("nomor itu lagi diproses — tunggu kodenya masuk dulu ya")
+                LOGIN_LOCK.add(phone)
                 try:
-                    sent = await client.send_code_request(phone)
-                except PhoneNumberInvalidError:
-                    await client.disconnect()
-                    return await reply("nomor nggak valid")
-                except FloodWaitError as e:
-                    await client.disconnect()
-                    return await reply(f"kena floodwait {e.seconds}s — coba lagi nanti")
-                except Exception as e:
-                    await client.disconnect()
-                    return await reply(f"gagal minta kode: `{e}`")
-                PENDING_LOGINS[name] = {
-                    "client": client, "phone": phone,
-                    "hash": sent.phone_code_hash, "session": session,
-                }
+                    # session dinamain dari nomornya, bukan dari label. Kalau pakai
+                    # label, `ub1` yang udah dihapus ninggalin session lama dan akun
+                    # itu bakal kepakai lagi walau nomornya beda.
+                    session = session_for_phone(phone)
+                    if any(b.cfg.get("session") == session for b in FLEET):
+                        return await reply("session buat nomor itu lagi dipake userbot lain")
+                    client = TelegramClient(str(BASE / session), API_ID, API_HASH)
+                    try:
+                        await client.connect()
+                    except Exception as e:
+                        return await reply(f"nggak bisa buka session: `{e}`\n"
+                                           f"_coba lagi sebentar lagi_")
+                    if await client.is_user_authorized():
+                        me = await client.get_me()
+                        if not same_phone(getattr(me, "phone", None), phone):
+                            await client.disconnect()
+                            who = ("@" + me.username) if getattr(me, "username", None) \
+                                  else (getattr(me, "first_name", None) or "akun lain")
+                            return await reply(
+                                f"⚠️ File session `{session}` isinya **{who}**, bukan `{phone}`.\n"
+                                f"Nggak saya pakai — takutnya salah akun yang ngirim.\n\n"
+                                f"_Hapus `{session}.session` di server kalau emang mau ganti akun._")
+                        PENDING_LOGINS[name] = {"client": client, "phone": phone,
+                                                "hash": None, "session": session}
+                        return await finish_login(name)
+                    try:
+                        sent = await client.send_code_request(phone)
+                    except PhoneNumberInvalidError:
+                        await client.disconnect()
+                        return await reply("nomor nggak valid")
+                    except FloodWaitError as e:
+                        await client.disconnect()
+                        return await reply(f"kena floodwait {e.seconds}s — coba lagi nanti")
+                    except Exception as e:
+                        await client.disconnect()
+                        return await reply(f"gagal minta kode: `{e}`")
+                    PENDING_LOGINS[name] = {
+                        "client": client, "phone": phone,
+                        "hash": sent.phone_code_hash, "session": session,
+                    }
+                finally:
+                    LOGIN_LOCK.discard(phone)
                 await reply(
                     f"📲 Kode dikirim ke `{phone}` (cek app Telegram akun itu).\n\n"
                     f"**Balas kodenya aja** — dipisah spasi, contoh: `1 2 3 4 5`\n\n"

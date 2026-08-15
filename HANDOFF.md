@@ -106,6 +106,13 @@ Contoh:
 
 > ⚠️ **Telegram nge-invalidate kode login yang ditulis mentahan di chat Telegram.** Makanya `/code` nerima angka yang dipisah (`1 2 3 4 5`, `12-345`) — non-digit dibuang otomatis. Habis login, **hapus pesan kodenya**. Kalau kodenya kadung mati, ulang `/addnumber`.
 
+**File session dinamain dari nomornya** (`session_acc_628…`), bukan dari label. Ini penting: label kayak `ub1` bisa dipakai ulang setelah `/delbot`, dan kalau session ikut label, akun lama bakal kepakai lagi walau lo masukin nomor yang beda. Efek sampingnya enak — nambah nomor yang **udah pernah** login di server ini langsung konek tanpa OTP (dan balasannya bilang begitu).
+
+Pengaman lain di jalur login:
+- nomor yang lagi diproses dikunci, jadi ngirim nomor dua kali nggak buka dua client ke file session yang sama (dulu bikin `database is locked`)
+- nomor yang udah kepasang ditolak, biar nggak ada dua userbot dengan akun sama
+- kalau file session isinya akun lain, login dibatalin dan bot nyebutin akun siapa yang ada di situ
+
 Userbot baru selalu lahir **aman**: `dry_run: true`, 0 source, allowlist kosong — jadi nggak bakal ngirim apa-apa sebelum lo isi sendiri.
 
 `/bots` nampilin tiap akun lengkap: label (`ub1`), **@username**, **nomor HP**, status, jumlah source & target. Identitas itu dibaca dari `get_me()` tiap kali proses start dan disimpen di `fleet.json -> userbots[].account`, jadi akun lama pun kebaca tanpa login ulang.
