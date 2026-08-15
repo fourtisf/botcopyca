@@ -65,6 +65,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("manager")
 
 START_TIME = time.time()
+BOT_USERNAME = ""      # filled in once the control bot logs in
 LOG_RING = collections.deque(maxlen=200)   # backs /log so the console can show recent lines
 
 
@@ -101,6 +102,26 @@ with open(FLEET_PATH) as f:
     FLEET_CONFIG = json.load(f)
 
 ADMIN_IDS = set(FLEET_CONFIG.get("admin_user_ids", []))
+
+# Relay that runs on the bot token alone — see BotUserbot. Only covers chats the
+# bot itself was added to, but needs no api_id.
+BOT_RELAY = FLEET_CONFIG.setdefault("bot_relay", {})
+BOT_RELAY.setdefault("name", "bot")
+BOT_RELAY.setdefault("session", "-")
+BOT_RELAY.setdefault("source_channels", [])
+BOT_RELAY.setdefault("chains", ["sol", "evm"])
+BOT_RELAY.setdefault("dedup_hours", 0)
+BOT_RELAY.setdefault("delay_between_groups_sec", 3)
+BOT_RELAY.setdefault("attribution", True)
+BOT_RELAY.setdefault("template", None)
+BOT_RELAY.setdefault("batch_window_sec", 0)
+BOT_RELAY.setdefault("max_per_day_per_group", 0)
+BOT_RELAY.setdefault("quiet_hours", None)
+BOT_RELAY.setdefault("chats", {})          # id -> {title, type} learned as messages arrive
+BOT_RELAY.setdefault("send_filter", {
+    "mode": "allowlist", "allowlist": [], "blocklist": [], "title_contains": [],
+    "include_groups": True, "include_channels": True, "dry_run": True,
+})
 USERBOT_CFGS = FLEET_CONFIG.get("userbots", [])
 if not USERBOT_CFGS and not CONTROL_BOT_TOKEN:
     raise SystemExit("fleet.json needs at least one userbot in 'userbots' — or set "
@@ -559,6 +580,156 @@ async def detach_userbot(bot):
 PENDING_LOGINS = {}   # bot name -> {client, phone, hash, session}
 
 
+# ---------------------------------------------------------------- bot-token relay (no api_id)
+
+def pseudo_dialog(cid, title, ctype="channel"):
+    """A dialog-shaped object built from a Bot API chat, so the filter/sender
+    code written against Telethon dialogs works untouched."""
+    ent = types_ns(id=cid, title=title, username=None)
+    return types_ns(id=cid, entity=ent, is_user=False,
+                    is_group=ctype in ("group", "supergroup"),
+                    is_channel=True)
+
+
+class _BotClient:
+    """send_message() on top of the Bot API, so sender_loop needs no changes."""
+
+    def __init__(self, ctrl):
+        self.ctrl = ctrl
+
+    async def send_message(self, entity, text, **_kw):
+        ok = await self.ctrl.send_checked(entity.id, text)
+        if not ok:
+            raise ChatWriteForbiddenError()
+
+
+class BotUserbot(Userbot):
+    """Relay driven by the bot token instead of a user account.
+
+    Sees only chats the bot has been added to — it cannot read someone else's
+    channel the way a userbot can. Everything downstream (dedup, batching, cap,
+    quiet hours, filters, counters) is the shared code path.
+    """
+
+    def __init__(self, cfg, ctrl):
+        super().__init__(cfg)
+        self.ctrl = ctrl
+        self.client = _BotClient(ctrl)
+        self.botmode = True
+
+    def known(self):
+        return {int(k): v for k, v in self.cfg.get("chats", {}).items()}
+
+    async def refresh_sources(self):
+        self.source_ids.clear()
+        self.source_names.clear()
+        known = self.known()
+        for s in self.cfg.get("source_channels", []):
+            try:
+                cid = int(s)
+            except (TypeError, ValueError):
+                log.warning(f"[{self.name}] source {s!r} bukan chat id — bot mode butuh id numerik")
+                continue
+            self.source_ids.add(cid)
+            self.source_names[cid] = (known.get(cid) or {}).get("title", str(cid))
+
+    async def refresh_targets(self):
+        fil = self.cfg.get("send_filter", {})
+        out = []
+        for cid, meta in self.known().items():
+            d = pseudo_dialog(cid, meta.get("title", str(cid)), meta.get("type", "channel"))
+            if not target_kind_ok(d, fil) or cid in self.source_ids:
+                continue
+            titles = fil.get("title_contains", [])
+            if titles and not any(k.lower() in (meta.get("title") or "").lower() for k in titles):
+                continue
+            mode = fil.get("mode", "allowlist")
+            if mode == "allowlist" and not any(dialog_matches(d, e) for e in fil.get("allowlist", [])):
+                continue
+            if mode == "blocklist" and any(dialog_matches(d, e) for e in fil.get("blocklist", [])):
+                continue
+            out.append(d)
+        self.targets = out
+
+    def learned_dialogs(self, kind, keyword=None):
+        """Stand-in for collect_dialogs(): the chats the bot has been added to."""
+        fil = self.cfg.get("send_filter", {})
+        out = []
+        for cid, meta in sorted(self.known().items(), key=lambda kv: kv[1].get("title", "")):
+            ctype = meta.get("type", "channel")
+            d = pseudo_dialog(cid, meta.get("title", str(cid)), ctype)
+            if kind == "channel" and ctype != "channel":
+                continue
+            if kind == "group":
+                if not target_kind_ok(d, fil) or cid in self.source_ids:
+                    continue
+            if keyword and keyword.lower() not in (meta.get("title") or "").lower():
+                continue
+            out.append(d)
+        return out
+
+
+def remember_chat(chat):
+    """Record a chat the bot can see, so it can be picked as source/target."""
+    ctype = chat.get("type")
+    if ctype not in ("group", "supergroup", "channel"):
+        return False
+    cid = str(chat.get("id"))
+    prev = BOT_RELAY["chats"].get(cid)
+    entry = {"title": chat.get("title") or cid, "type": ctype}
+    if prev != entry:
+        BOT_RELAY["chats"][cid] = entry
+        save_fleet()
+        log.info(f"[bot] kenal chat baru: {entry['title']} ({cid})")
+        return True
+    return False
+
+
+def botapi_text(msg):
+    """Message text + hidden hyperlink URLs + inline button URLs, Bot API shape."""
+    chunks = [msg.get("text") or msg.get("caption") or ""]
+    for key in ("entities", "caption_entities"):
+        for e in msg.get(key) or []:
+            if e.get("url"):
+                chunks.append(e["url"])
+    for row in (msg.get("reply_markup") or {}).get("inline_keyboard") or []:
+        for b in row:
+            if b.get("url"):
+                chunks.append(b["url"])
+    return "\n".join(chunks)
+
+
+async def on_bot_message(chat, msg):
+    """A message landed in a chat the bot is in — relay it if that chat is a source."""
+    remember_chat(chat)
+    bots = [b for b in FLEET if getattr(b, "botmode", False)]
+    if not bots:
+        return
+    bot = bots[0]
+    cid = chat.get("id")
+    if cid not in bot.source_ids:
+        return
+    src = bot.source_names.get(cid, chat.get("title") or str(cid))
+    for ca, chain in extract_cas(botapi_text(msg), bot.cfg.get("chains", ["sol", "evm"])):
+        if ca in bot.inflight or already_posted(bot.name, ca, bot.cfg.get("dedup_hours", 0)):
+            bot.counters["dup_skips"] += 1
+            continue
+        bot.inflight.add(ca)
+        log.info(f"[{bot.name}] NEW {chain.upper()} {ca} from {src} -> queue")
+        await bot.queue.put((ca, chain, src))
+
+
+async def attach_bot_relay(ctrl):
+    b = BotUserbot(BOT_RELAY, ctrl)
+    await b.refresh_sources()
+    await b.refresh_targets()
+    b.sender_task = asyncio.create_task(sender_loop(b))
+    FLEET.append(b)
+    log.info(f"[{b.name}] bot-mode relay siap — {len(b.source_ids)} source -> "
+             f"{len(b.targets)} target, {len(b.known())} chat dikenal")
+    return b
+
+
 # ---------------------------------------------------------------- sender loop
 
 async def sender_loop(bot: Userbot):
@@ -659,7 +830,7 @@ async def sender_loop(bot: Userbot):
 def menu_main():
     return [
         [("📊 Status", "/status"), ("📈 Stats", "/stats")],
-        [("🤖 Userbot", "/bots"), ("➕ Tambah akun", "/addnumber")],
+        [("🤖 Userbot", "/bots"), ("📋 Chat bot", "/chats")],
         [("🛡 Anti-spam", "/antispam"), ("❓ Command", "/help")],
         [("🔄 Refresh", "/menu"), ("🩺 Info", "/version")],
     ]
@@ -817,6 +988,43 @@ def register_control(control):
                     + f"\n\n📊 relayed {c['relayed']} · dup {c['dup_skips']} · ok {c['sends_ok']} · fail {c['sends_fail']}"
                 )
                 await reply(txt, menu_bot(b))
+
+            elif cmd == "here":
+                chat = getattr(event, "chat", None) or {}
+                if chat.get("type") not in ("group", "supergroup", "channel"):
+                    return await reply("Ketik `/here` **di dalam** group/channel yang mau dipakai, "
+                                       "bukan di chat pribadi ini.")
+                remember_chat(chat)
+                bots = [b for b in FLEET if getattr(b, "botmode", False)]
+                if bots:
+                    await bots[0].refresh_targets()
+                await reply(f"✅ `{chat.get('title')}` kecatat (id `{chat.get('id')}`).\n"
+                            f"Sekarang bisa dipilih lewat `/listchannels bot` atau `/listgroups bot`.")
+
+            elif cmd == "chats":
+                bots = [b for b in FLEET if getattr(b, "botmode", False)]
+                if not bots:
+                    return await reply("bot-mode relay nggak aktif")
+                b = bots[0]
+                known = b.known()
+                if not known:
+                    return await reply(
+                        "**Belum ada chat yang dikenal**\n\n"
+                        "Cara nambahin:\n"
+                        "1. Add @" + (BOT_USERNAME or "botlo") + " ke channel/group\n"
+                        "2. Khusus channel: jadiin **admin** + hak *Post Messages*\n"
+                        "3. Kirim 1 pesan di sana, atau ketik `/here` di sana\n\n"
+                        "_Bot cuma bisa baca chat yang dia di-add. Buat nyedot channel "
+                        "orang, butuh api_id + userbot._")
+                lines = [f"**{len(known)} chat dikenal**", "📡 = source · 🎯 = target", ""]
+                tids = {d.id for d in b.targets}
+                for cid, meta in known.items():
+                    mark = "📡" if cid in b.source_ids else ("🎯" if cid in tids else "▫️")
+                    lines.append(f"{mark} {meta.get('title')} — `{cid}` ({meta.get('type')})")
+                lines += ["", f"jadiin source: `/listchannels bot` → `/addsource bot #1`",
+                          f"jadiin target: `/listgroups bot` → `/allow bot #1`"]
+                await reply("\n".join(lines), [[("📡 Source", "/listchannels bot"),
+                                                ("🎯 Target", "/listgroups bot")]])
 
             elif cmd == "antispam":
                 lines = ["**Anti-spam**", ""]
@@ -1000,11 +1208,18 @@ def register_control(control):
             elif cmd in ("addnumber", "addbot"):
                 if not CREDS_OK:
                     return await reply(
-                        "⚠️ **Mode terbatas** — `/addnumber` belum bisa dipakai.\n\n"
-                        "Nambah userbot itu login akun Telegram beneran, dan itu butuh "
-                        "`API_ID` + `API_HASH` di `.env` (bukan token bot).\n\n"
-                        "Ambil di https://my.telegram.org → *API development tools*, "
-                        "isi ke `.env`, terus `pm2 restart callrelay`."
+                        "⚠️ `/addnumber` butuh `api_id` — nambah userbot itu login akun "
+                        "Telegram beneran, nggak bisa pakai token bot.\n\n"
+                        "**Tapi relay tetep bisa jalan sekarang** pakai bot ini langsung:\n"
+                        "1. Add @" + (BOT_USERNAME or "bot lo") + " ke channel sumber "
+                        "(jadiin admin kalau itu channel)\n"
+                        "2. Add juga ke group/channel tujuan, kasih hak kirim\n"
+                        "3. Balik ke sini → `/chats` buat liat yang kebaca\n\n"
+                        "_Bedanya: bot cuma bisa baca chat yang dia di-add. Userbot bisa "
+                        "baca channel mana pun yang akunnya join._\n\n"
+                        "Kalau tetep mau userbot: ambil api_id di https://my.telegram.org "
+                        "(*API development tools*), isi ke `.env`, terus `pm2 restart callrelay`.",
+                        [[("📋 Lihat chat", "/chats")]]
                     )
                 if len(args) < 2:
                     return await reply("usage: `/addnumber <name> <+62812xxxx>`")
@@ -1109,7 +1324,15 @@ def register_control(control):
                 b = bots[0]
                 kind = "channel" if cmd == "listchannels" else "group"
                 keyword = " ".join(args[1:]) or None
-                dialogs = await collect_dialogs(b, kind, keyword)
+                dialogs = (b.learned_dialogs(kind, keyword) if getattr(b, "botmode", False)
+                           else await collect_dialogs(b, kind, keyword))
+                if getattr(b, "botmode", False) and not dialogs and not b.known():
+                    return await reply(
+                        "Bot ini belum di-add ke chat mana pun.\n\n"
+                        "1. Add @" + (BOT_USERNAME or "botlo") + " ke channel/group\n"
+                        "2. Buat channel: jadiin **admin** dengan hak *Post Messages*\n"
+                        "3. Kirim 1 pesan di situ (atau ketik `/here` di sana)\n"
+                        "4. Balik ke sini, ulang command-nya")
                 b.listing[kind] = dialogs
                 if not dialogs:
                     return await reply(f"`{b.name}` nggak punya {kind} yang cocok"
@@ -1226,10 +1449,10 @@ def register_control(control):
                 if not CREDS_OK:
                     lines += [
                         "",
-                        "⚠️ **MODE TERBATAS** — `API_ID`/`API_HASH` di `.env` belum diisi.",
-                        "Control bot jalan (lo lagi ngobrol sama gue), tapi userbot belum bisa:",
-                        "relay CA dan `/addnumber` butuh api_id dari my.telegram.org.",
-                        "Yang udah bisa dicoba sekarang: `/help`, `/status`, `/stats`.",
+                        "⚠️ **MODE BOT** — belum ada `api_id`, jadi userbot mati.",
+                        "Tapi relay tetep bisa jalan pakai token bot: bot cuma baca chat",
+                        "yang dia di-add. Mulai dari `/chats`.",
+                        "_Buat nyedot channel orang (tanpa bisa nge-add bot), butuh api_id._",
                         "",
                     ]
                 if not FLEET:
@@ -1311,7 +1534,9 @@ def register_control(control):
                     picked, bad = parse_indices(rest, b.listing["channel"])
                     if bad:
                         return await reply(f"nomor nggak valid: {', '.join(bad)}")
-                    entries = [dialog_ref(d) for d in picked]
+                    # bot mode addresses chats by numeric id only
+                    entries = [d.id if getattr(b, "botmode", False) else dialog_ref(d)
+                               for d in picked]
                 else:
                     entries = [rest[0]]
 
@@ -1470,6 +1695,23 @@ class BotApiControl:
     async def call(self, method, http_timeout=15, **params):
         return await asyncio.to_thread(self._post, method, params, http_timeout)
 
+    async def send_checked(self, chat_id, text):
+        """Like send() but reports failure, so the relay can count it."""
+        try:
+            r = await self.call("sendMessage", chat_id=chat_id, text=text,
+                                parse_mode="Markdown", disable_web_page_preview="true")
+            if r.get("ok"):
+                return True
+            log.warning(f"relay send rejected ({chat_id}): {r.get('description')}")
+        except Exception as e:
+            log.warning(f"relay send failed ({chat_id}): {e}")
+        try:
+            r = await self.call("sendMessage", chat_id=chat_id, text=text,
+                                disable_web_page_preview="true")
+            return bool(r.get("ok"))
+        except Exception:
+            return False
+
     async def send(self, chat_id, text, buttons=None):
         extra = {"reply_markup": to_botapi_markup(buttons)} if buttons else {}
         try:
@@ -1498,7 +1740,8 @@ class BotApiControl:
         while True:
             try:
                 r = await self.call("getUpdates", http_timeout=70, offset=self.offset,
-                                    timeout=50, allowed_updates='["message","callback_query"]')
+                                    timeout=50,
+                                    allowed_updates='["message","channel_post","callback_query"]')
             except Exception as e:
                 log.warning(f"getUpdates failed: {e}")
                 await asyncio.sleep(5)
@@ -1519,8 +1762,14 @@ class BotApiControl:
                     if not msg.get("chat"):
                         continue
                 else:
-                    msg = upd.get("message") or {}
+                    msg = upd.get("message") or upd.get("channel_post") or {}
                     text = msg.get("text") or ""
+                    chat = msg.get("chat") or {}
+                    if chat.get("type") in ("group", "supergroup", "channel"):
+                        try:      # learn the chat, and relay it if it is a source
+                            await on_bot_message(chat, msg)
+                        except Exception as e:
+                            log.error(f"relay error: {e}")
                 if not text.startswith("/"):
                     continue
                 try:
@@ -1534,7 +1783,8 @@ class BotApiEvent:
 
     def __init__(self, ctrl, msg, text):
         self._ctrl = ctrl
-        self._chat = msg["chat"]["id"]
+        self.chat = msg.get("chat") or {}
+        self._chat = self.chat.get("id")
         self.raw_text = text
         self.sender_id = (msg.get("from") or {}).get("id")
 
@@ -1618,7 +1868,11 @@ async def main():
             control = await BotApiControl(CONTROL_BOT_TOKEN).start()
         register_control(control)
         me = await control.get_me()
+        globals()["BOT_USERNAME"] = me.username or ""
         log.info(f"control bot live: @{me.username} (admins: {sorted(ADMIN_IDS)})")
+        if isinstance(control, BotApiControl):
+            # no api_id: the bot token itself can still relay, for chats the bot is in
+            await attach_bot_relay(control)
     else:
         log.warning("No CONTROL_BOT_TOKEN — running without control bot; /addnumber unavailable")
 

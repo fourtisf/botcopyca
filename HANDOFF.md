@@ -51,6 +51,37 @@ Semua userbot **share satu `api_id`/`api_hash`** (api_id itu per-app, bukan per-
    pm2 save && pm2 logs callrelay
    ```
 
+## Dua cara jalan: bot mode vs userbot
+
+| | **Bot mode** (token doang) | **Userbot** (butuh api_id) |
+|---|---|---|
+| Butuh apa | `CONTROL_BOT_TOKEN` | `API_ID` + `API_HASH` + login nomor HP |
+| Bisa baca | cuma chat yang **bot-nya di-add** | channel mana pun yang **akunnya join** |
+| Nyedot channel orang | ❌ nggak bisa | ✅ bisa |
+| Risiko ban akun | nggak ada | ada (makanya pakai akun alt) |
+| Setup | add bot ke chat, kelar | my.telegram.org + OTP |
+
+Kalau `.env` belum ada api_id valid, manager otomatis jalan **bot mode**: control bot nyala dan satu relay bernama `bot` kedaftar di fleet. Semua fitur (dedup, batch, cap, quiet, filter, template, counter) jalan sama persis — bedanya cuma sumber datanya.
+
+### Setup bot mode (3 menit, tanpa api_id)
+
+1. Add bot lo ke **channel sumber**. Kalau itu channel (bukan group), jadiin **admin** — bot nggak dapet pesan channel kalau bukan admin.
+2. Add juga ke **group/channel tujuan**, pastiin punya hak kirim.
+3. Chat bot lo:
+   ```
+   /chats                      → daftar chat yang kebaca
+   /listchannels bot           → pilih sumber
+   /addsource bot #1
+   /listgroups bot             → pilih tujuan
+   /allow bot #1,2
+   /groups bot                 → cek
+   /dryrun bot off             → live
+   ```
+
+Bot belajar chat sendiri begitu ada pesan masuk di situ. Kalau males nunggu, ketik `/here` **di dalam** chat itu — langsung kecatat.
+
+Source channel otomatis dikecualiin dari daftar target, jadi nggak mungkin echo.
+
 ## Control bot commands (chat langsung ke bot)
 
 ### Tambah akun (nomor HP) — tanpa restart
