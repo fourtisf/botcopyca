@@ -1069,6 +1069,61 @@ async def attach_bot_relay(ctrl):
 
 # ---------------------------------------------------------------- sender loop
 
+CONTROL = None          # diisi register_control — dipakai buat lapor ke admin
+
+
+def reports_on():
+    return bool(FLEET_CONFIG.get("report_sends", True))
+
+
+async def notify_admins(text, buttons=None):
+    """Kirim ke tiap admin lewat control bot. Diem-diem gagal — laporan nggak
+    boleh ngerusak jalur kirim CA."""
+    if CONTROL is None or not ADMIN_IDS:
+        return
+    for uid in sorted(ADMIN_IDS):
+        try:
+            if isinstance(CONTROL, BotApiControl):
+                await CONTROL.send(uid, text, buttons)
+            else:
+                await CONTROL.send_message(uid, text, parse_mode="md", link_preview=False)
+        except Exception as e:
+            log.warning(f"lapor ke admin {uid} gagal: {e}")
+
+
+async def report_delivery(bot, items, report, quiet):
+    """Lapor hasil sekali kirim: CA-nya apa, masuk ke group mana, yang gagal kenapa."""
+    if not reports_on():
+        return
+    ok = [r for r in report if r[0]]
+    bad = [r for r in report if not r[0]]
+    if quiet:
+        return await notify_admins(
+            f"🌙 `{bot.name}` — jam tenang {bot.cfg.get('quiet_hours')}, "
+            f"{len(items)} CA ditahan dulu")
+    if not report:
+        if bot.paused:
+            return await notify_admins(f"⏸ `{bot.name}` lagi pause — {len(items)} CA nggak dikirim")
+        return await notify_admins(
+            f"⚠️ `{bot.name}` — {len(items)} CA nggak kekirim: belum ada group tujuan.\n"
+            f"Pilih dulu di `/listgroups {bot.name}`")
+    head = (f"{'✅' if ok else '❌'} **{bot.name}** — {len(ok)}/{len(report)} group"
+            + (f" · {len(items)} CA" if len(items) > 1 else ""))
+    lines = [head, ""]
+    for ca, _, _ in items[:3]:
+        lines.append(f"`{ca}`")
+    if len(items) > 3:
+        lines.append(f"_+{len(items) - 3} CA lagi_")
+    lines.append("")
+    for good, d, why in report[:10]:
+        title = (getattr(d.entity, "title", None) or str(d.id))[:28]
+        lines.append(f"✅ {title}" if good else f"❌ {title} — {why}")
+    if len(report) > 10:
+        lines.append(f"_+{len(report) - 10} group lagi_")
+    await notify_admins("\n".join(lines),
+                        [[("🔕 Matiin laporan", "/lapor off"), ("📊 Stats", f"/stats {bot.name}")]])
+
+
 async def sender_loop(bot: Userbot):
     """Fan one CA out to every target group.
 
@@ -1101,6 +1156,7 @@ async def sender_loop(bot: Userbot):
             text = build_digest(cfg, items)
             label = f"{len(items)} CA" if len(items) > 1 else f"{items[0][0][:10]}…"
             delivered = 0
+            report = []              # (ok, nama chat, alasan) buat lapor ke admin
             quiet = in_quiet_hours(cfg)
 
             if quiet:
@@ -1112,6 +1168,7 @@ async def sender_loop(bot: Userbot):
                         break
                     if cap_reached(cfg, d.id):
                         log.info(f"[{bot.name}] daily cap reached for {dialog_name(d)} — skip")
+                        report.append((False, d, "kena limit harian"))
                         continue
                     if dry:
                         log.info(f"[{bot.name}][DRY] would send {label} -> {dialog_name(d)}")
@@ -1121,6 +1178,7 @@ async def sender_loop(bot: Userbot):
                         bot.counters["sends_ok"] += 1
                         delivered += 1
                         bump_send(bot.name, d.id)
+                        report.append((True, d, None))
                         log.info(f"[{bot.name}] sent {label} -> {dialog_name(d)}")
                     except FloodWaitError as e:
                         log.warning(f"[{bot.name}] floodwait {e.seconds}s")
@@ -1130,14 +1188,18 @@ async def sender_loop(bot: Userbot):
                             bot.counters["sends_ok"] += 1
                             delivered += 1
                             bump_send(bot.name, d.id)
+                            report.append((True, d, None))
                         except Exception as e2:
                             bot.counters["sends_fail"] += 1
+                            report.append((False, d, str(e2)[:60]))
                             log.error(f"[{bot.name}] retry failed {dialog_name(d)}: {e2}")
                     except ChatWriteForbiddenError:
                         bot.counters["sends_fail"] += 1
+                        report.append((False, d, "nggak punya izin kirim"))
                         log.error(f"[{bot.name}] no write perm in {dialog_name(d)} — skip")
                     except Exception as e:
                         bot.counters["sends_fail"] += 1
+                        report.append((False, d, str(e)[:60]))
                         log.error(f"[{bot.name}] send failed {dialog_name(d)}: {e}")
                     await asyncio.sleep(delay)
 
@@ -1150,6 +1212,8 @@ async def sender_loop(bot: Userbot):
             else:
                 log.warning(f"[{bot.name}] {label} reached 0 groups — not recorded, "
                             f"will relay again next time it shows up")
+            if not dry:
+                await report_delivery(bot, items, report, quiet)
         except Exception as e:
             log.error(f"[{bot.name}] sender error: {e}")
         finally:
@@ -1373,6 +1437,8 @@ HELP = (
     "`/template <bot> <teks|reset>` — format sendiri: `{ca}` `{chain}` `{links}` `{source}`\n"
     "`/attribution <bot> <on|off>` — tampilin nama source\n"
     "`/chains <bot> <sol|evm|both>` · `/dedup <bot> <jam>`\n\n"
+    "**Laporan**\n"
+    "`/lapor on|off` — notif tiap CA dikirim (masuk group mana, gagal kenapa)\n\n"
     "**Operasi**\n"
     "`/menu` · `/status` · `/stats <bot|all>`\n"
     "`/pause <bot|all>` · `/resume <bot|all>`\n"
@@ -1397,6 +1463,9 @@ HELP = (
 
 
 def register_control(control):
+    global CONTROL
+    CONTROL = control
+
     @control.on(events.NewMessage())
     async def on_cmd(event):
         if not ADMIN_IDS and is_private_chat(event):
@@ -1567,6 +1636,7 @@ def register_control(control):
                     f"🎯 Ke: **{len(b.targets)}** chat"
                     + (f" (👥 {n_grp} group · 📢 {n_ch} channel)" if n_ch else
                        f" (👥 {n_grp} group)" if n_grp else "") + "\n"
+                    f"🔔 Laporan kirim: {'ON' if reports_on() else 'OFF'}\n"
                     f"⏱ Jeda antar group: {b.cfg.get('delay_between_groups_sec', 5)}s"
                     + (f" · batch {b.cfg['batch_window_sec'] // 60}m" if b.cfg.get("batch_window_sec") else "")
                     + (f" · max {b.cfg['max_per_day_per_group']}/group/hari" if b.cfg.get("max_per_day_per_group") else "")
@@ -1577,6 +1647,8 @@ def register_control(control):
                     txt += "\n\n⚠️ _Belum jalan: " + "; ".join(blockers) + "_"
                 rows = [[("🔴 Matiin auto-kirim" if live else "🟢 Nyalain auto-kirim",
                           f"/auto {b.name} {'off' if live else 'on'}")],
+                        [(f"🔔 Laporan: {'ON' if reports_on() else 'OFF'}",
+                          f"/lapor {'off' if reports_on() else 'on'}")],
                         [("📡 Pilih channel sumber", f"/listchannels {b.name}"),
                          ("🎯 Pilih group tujuan", f"/listgroups {b.name}")],
                         [("🧪 Tes kirim sekarang", f"/testca {b.name}"),
@@ -2166,6 +2238,20 @@ def register_control(control):
                                        [[("❌ Batal", f"/cancel {name}")]])
                 p.pop("needs_password", None)
                 await finish_login(name)
+
+            elif cmd in ("lapor", "report"):
+                if args and args[0] in ("on", "off"):
+                    FLEET_CONFIG["report_sends"] = args[0] == "on"
+                    save_fleet()
+                on = reports_on()
+                await reply(
+                    f"🔔 **Laporan kirim: {'ON' if on else 'OFF'}**\n\n"
+                    + ("Tiap CA yang dikirim bakal dilaporin ke sini — masuk ke group mana, "
+                       "yang gagal kenapa." if on else
+                       "Kirim CA jalan terus, cuma nggak ada laporannya. Cek manual pakai "
+                       "`/stats` atau `/last`."),
+                    [[("🔕 Matiin" if on else "🔔 Nyalain", f"/lapor {'off' if on else 'on'}")],
+                     [("📊 Stats", "/stats"), ("📜 Riwayat", "/last")]])
 
             elif cmd in ("reset", "resetall"):
                 real = [b for b in FLEET if not getattr(b, "botmode", False)]
@@ -2860,6 +2946,7 @@ BOT_COMMANDS = [
     ("log", "Log terakhir — /log 10"),
     ("version", "Mode, uptime, jumlah bot"),
     ("addnumber", "Tambah userbot (butuh api_id)"),
+    ("lapor", "Laporan tiap kirim CA: on/off"),
     ("reset", "Hapus semua — userbot, source, target"),
     ("help", "Semua command"),
 ]

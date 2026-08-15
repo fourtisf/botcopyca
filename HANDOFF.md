@@ -180,6 +180,26 @@ Bawaannya **CA doang** — satu pesan = satu string CA, tanpa judul, link, nama 
 | `/template <bot> reset` | Balik ke CA doang |
 | `/template <bot> <teks>` | Bikin sendiri — placeholder `{ca}` `{chain}` `{links}` `{source}` |
 
+### Laporan kirim
+
+Tiap kali CA selesai difanout, admin dapet satu laporan — bukan satu per group, satu per pengiriman:
+
+```
+✅ Jeffryyoung — 2/3 group
+
+So11111111111111111111111111111111111111112
+
+✅ My VIP Group
+✅ Trading Squad
+❌ Second Group — nggak punya izin kirim
+```
+
+| Command | Fungsi |
+|---|---|
+| `/lapor on` `off` | Nyalain/matiin laporan. Kesimpen di `fleet.json -> report_sends`. Tombolnya ada di `/auto` |
+
+Laporan juga muncul buat kondisi yang bikin CA nggak jadi dikirim: jam tenang, pause, atau belum ada group tujuan — jadi ketauan kenapa sepi. Dry-run nggak dilaporin (biar nggak berisik pas lagi nyetel), dan kalau ngirim laporannya gagal, jalur kirim CA tetep jalan.
+
 ### Anti-spam
 
 | Command | Fungsi |
