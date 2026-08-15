@@ -857,6 +857,85 @@ async def sender_loop(bot: Userbot):
 # Buttons carry the command they stand for, so a tap and a typed command take
 # the exact same path through on_cmd(). Works on both transports.
 
+def onboarding_step():
+    """Langkah berikutnya berdasarkan kondisi nyata — dipakai /start & /menu.
+    -> (judul, perintah, label tombol, command tombol)"""
+    if not CREDS_OK:
+        return ("Isi `API_ID` di .env dulu",
+                "Tanpa itu userbot nggak bisa login. Relay bot-mode tetep bisa dipakai.",
+                "📋 Chat bot", "/chats")
+    if not FLEET:
+        return ("Tambah userbot pertama",
+                "`/addnumber ub1 +628xxxxxxxxx`\nKode OTP masuk ke app Telegram akun itu.",
+                "➕ Tambah akun", "/addnumber")
+    b = FLEET[0]
+    if not b.source_ids:
+        return (f"Pilih channel yang mau dipantau",
+                f"`/listchannels {b.name}` → `/addsource {b.name} #1,2`",
+                "📡 Pilih source", f"/listchannels {b.name}")
+    if not b.targets:
+        return ("Pilih group tujuan",
+                f"`/listgroups {b.name}` → `/allow {b.name} #1,2`",
+                "🎯 Pilih target", f"/listgroups {b.name}")
+    if b.cfg.get("send_filter", {}).get("dry_run", True):
+        return ("Uji dulu, baru live",
+                f"`/testca {b.name}` buat nyoba · kalau udah oke `/dryrun {b.name} off`",
+                "🧪 Test CA", f"/testca {b.name}")
+    return ("Udah jalan ▶️",
+            f"{len(b.source_ids)} source → {len(b.targets)} target. Pantau lewat `/status`.",
+            "📊 Status", "/status")
+
+
+def screen_start():
+    """Halaman sambutan — beda dari /menu yang isinya panel operasional."""
+    judul, detail, blabel, bcmd = onboarding_step()
+    live = [b for b in FLEET if not b.paused
+            and not b.cfg.get("send_filter", {}).get("dry_run", True)]
+    if not CREDS_OK:
+        state = "⚠️ mode bot — belum ada `api_id`"
+    elif live:
+        state = f"🟢 live — {len(live)} userbot ngirim"
+    elif FLEET:
+        state = f"🟡 siap — {len(FLEET)} userbot, belum live"
+    else:
+        state = "⚪️ kosong — belum ada userbot"
+
+    text = (
+        "🚀 **CALLRELAY**\n"
+        "_Relay contract address dari channel call ke group lo — otomatis, 24 jam._\n\n"
+        "```\n"
+        "pantau channel  →  ambil CA  →  buang duplikat  →  kirim ke group\n"
+        "```\n"
+        f"**Status:** {state}\n\n"
+        f"➡️ **Langkah lo sekarang: {judul}**\n{detail}"
+    )
+    return text, [
+        [(blabel, bcmd), ("📖 Panduan", "/panduan")],
+        [("📋 Menu", "/menu"), ("❓ Command", "/help")],
+    ]
+
+
+PANDUAN = (
+    "📖 **Panduan singkat**\n\n"
+    "**1. Tambah akun** — akun alt, jangan akun utama\n"
+    "`/addnumber ub1 +628xxxxxxxxx`\n"
+    "`/code ub1 1 2 3 4 5`  ← tulis OTP dipisah spasi\n\n"
+    "**2. Pilih channel sumber** — akun itu harus udah join\n"
+    "`/listchannels ub1` → `/addsource ub1 #1,2`\n\n"
+    "**3. Pilih group tujuan** — akun itu harus udah join & bisa kirim\n"
+    "`/listgroups ub1` → `/allow ub1 #1,3`\n\n"
+    "**4. Uji, baru live**\n"
+    "`/testca ub1` → cek pesannya nongol di group\n"
+    "`/dryrun ub1 off` → mulai relay beneran\n\n"
+    "**Biar nggak berasa spam**\n"
+    "`/batch ub1 10` — 10 menit CA dikumpulin jadi 1 pesan recap\n"
+    "`/cap ub1 20` — max 20 pesan per group per hari\n"
+    "`/quiet ub1 23:00-07:00` — jam tenang\n\n"
+    "⚠️ Userbot itu akun beneran yang ngirim. Pakai **akun alt**, dan isi target "
+    "cuma **group lo sendiri** — bukan buat nge-blast group orang."
+)
+
+
 def menu_main():
     return [
         [("📊 Status", "/status"), ("📈 Stats", "/stats")],
@@ -986,16 +1065,27 @@ def register_control(control):
             )
 
         try:
-            if cmd in ("help", "start", "menu"):
+            if cmd == "start":
+                text, rows = screen_start()
+                await reply(text, rows)
+
+            elif cmd == "panduan":
+                await reply(PANDUAN, [[("📋 Menu", "/menu"), ("❓ Command", "/help")]])
+
+            elif cmd in ("help", "menu"):
                 if cmd == "help":
                     await reply(HELP, menu_main())
                 else:
-                    head = "**CALLRELAY**\n"
+                    judul, detail, blabel, bcmd = onboarding_step()
+                    head = (f"📋 **Menu** — {len(FLEET)} userbot · "
+                            f"jam server {time.strftime('%H:%M')}\n")
                     if not CREDS_OK:
-                        head += "⚠️ mode terbatas — belum ada `api_id`, relay belum jalan\n"
-                    head += (f"\n{len(FLEET)} userbot · jam server {time.strftime('%H:%M')}\n"
-                             f"_tap tombol, atau ketik `/help` buat semua command_")
-                    await reply(head, menu_main())
+                        head += "⚠️ mode bot — belum ada `api_id`\n"
+                    head += f"\n➡️ _lanjut: {judul}_"
+                    rows = menu_main()
+                    if bcmd not in ("/status",):
+                        rows = [[(blabel, bcmd)]] + rows
+                    await reply(head, rows)
 
             # ---------------------------------------------------- userbot panel
             elif cmd == "bots":
@@ -1893,12 +1983,23 @@ def register_control(control):
 
             elif cmd == "stats":
                 bots = find_bots(args[0]) if args else FLEET
-                lines = ["**Stats**"]
+                if not bots:
+                    judul, detail, blabel, bcmd = onboarding_step()
+                    return await reply(f"📈 **Stats** — belum ada data\n\n"
+                                       f"Belum ada userbot yang jalan, jadi belum ada yang "
+                                       f"kehitung.\n\n➡️ _{judul}_\n{detail}",
+                                       [[(blabel, bcmd), ("📋 Menu", "/menu")]])
+                total = {k: sum(b.counters[k] for b in bots) for k in bots[0].counters}
+                lines = [f"📈 **Stats** — {len(bots)} userbot", ""]
                 for b in bots:
                     c = b.counters
-                    lines.append(f"• `{b.name}` relayed {c['relayed']} · dup {c['dup_skips']} · "
+                    lines.append(f"• `{b.name}` relayed **{c['relayed']}** · dup {c['dup_skips']} · "
                                  f"ok {c['sends_ok']} · fail {c['sends_fail']}")
-                await reply("\n".join(lines))
+                if len(bots) > 1:
+                    lines += ["", f"**Total** relayed {total['relayed']} · dup {total['dup_skips']} "
+                                  f"· ok {total['sends_ok']} · fail {total['sends_fail']}"]
+                lines.append("\n_relayed = CA masuk · ok/fail = pesan kekirim per chat_")
+                await reply("\n".join(lines), [[("📜 Riwayat", "/last"), ("🔄 Refresh", "/stats")]])
 
             else:
                 await reply("unknown command — `/help`", menu_main())
@@ -1946,7 +2047,9 @@ def botapi_post(token, method, params, timeout=30):
 # Telegram only shows the "/" autocomplete for commands registered with
 # setMyCommands. Without this the console works but looks empty in the client.
 BOT_COMMANDS = [
+    ("start", "Halaman awal + langkah berikutnya"),
     ("menu", "Menu utama (tombol)"),
+    ("panduan", "Cara pakai dari nol"),
     ("status", "Status semua bot"),
     ("ping", "Ukur delay bot"),
     ("diag", "Cek update dari Telegram nyampe apa nggak"),
