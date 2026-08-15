@@ -1013,7 +1013,7 @@ def screen_start():
         "**✨ Yang bisa dilakuin**\n\n"
         "🤖 **Multi-akun** — banyak userbot, satu proses, diatur dari chat ini\n"
         "📡 **Multi-source** — pantau banyak channel sekaligus\n"
-        "🎯 **Target bebas** — group atau channel, dipilih pakai nomor\n"
+        "🎯 **Target bebas** — group & channel yang udah di-join, tinggal tap\n"
         "🛡 **Anti-spam** — kumpulin CA jadi 1 recap, batas harian, jam tenang\n"
         "✏️ **Format sendiri** — template pesan bisa diganti\n"
         "📊 **Statistik** — riwayat CA, ranking source, counter\n"
@@ -1022,8 +1022,12 @@ def screen_start():
         "━━━━━━━━━━━━━━━━━━\n"
         f"➡️ **Langkah lo sekarang: {judul}**\n{detail}"
     )
-    rows = [
-        [(blabel, bcmd)],                                    # langkah berikutnya, selebar layar
+    rows = [[(blabel, bcmd)]]                                # langkah berikutnya, selebar layar
+    if FLEET:                                                # pilih source & target langsung
+        n = FLEET[0].name
+        rows.append([("📡 Channel sumber", f"/listchannels {n}"),
+                     ("🎯 Group / channel tujuan", f"/listgroups {n}")])
+    rows += [
         [("📊 Status", "/status"), ("📈 Stats", "/stats")],
         [("🤖 Userbot", "/bots"),
          ("➕ Tambah akun", "/addnumber") if CREDS_OK else ("📋 Chat bot", "/chats")],
