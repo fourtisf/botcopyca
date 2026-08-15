@@ -116,6 +116,8 @@ Pengaman lain di jalur login:
 
 Userbot baru selalu lahir **aman**: `dry_run: true`, 0 source, allowlist kosong — jadi nggak bakal ngirim apa-apa sebelum lo isi sendiri.
 
+**Label userbot ngikut akunnya**, bukan urutan: login pakai akun @Jeffryyoung jadi `Jeffryyoung`, akun tanpa username jadi `akun1118` (4 digit terakhir nomor). Jadi nggak ada lagi tebak-tebakan `ub1` itu akun siapa. Nama manual lewat `/addnumber <nama> <nomor>` tetep dihormati sampai login kelar.
+
 `/bots` nampilin tiap akun lengkap: label (`ub1`), **@username**, **nomor HP**, status, jumlah source & target. Identitas itu dibaca dari `get_me()` tiap kali proses start dan disimpen di `fleet.json -> userbots[].account`, jadi akun lama pun kebaca tanpa login ulang.
 
 ### Pilih source channel & target group (bernomor)
@@ -144,6 +146,16 @@ Alur normalnya:
 Nomor `#n` ngikutin listing **terakhir** buat bot itu. Habis join/leave group baru, jalanin listing-nya lagi biar nomornya fresh.
 
 **Source channel nggak akan pernah jadi target.** Dia otomatis kefilter dari `/listgroups` dan dari daftar target — biar CA yang lo relay nggak masuk balik ke channel yang lagi lo pantau (echo).
+
+### Join channel/group
+
+Userbot **cuma bisa baca dan kirim di chat yang dia udah join** — itu batasan Telegram, bukan batasan bot ini. Buat channel tujuan, akunnya malah harus **admin dengan hak Post Messages**.
+
+| Command | Fungsi |
+|---|---|
+| `/join <bot> @ch1 @ch2` | Suruh userbot join channel/group publik. Link `t.me/+invite` juga jalan. Ada jeda 1 detik antar-join biar nggak kena limit |
+
+`/addsource <bot> @nama` **auto-join sendiri** kalau akunnya belum join channel itu — balasannya nandain "baru di-join". Kalau join-nya ditolak (channel privat, kena limit), alasannya disebutin, nggak diem-diem gagal.
 
 ### Auto kirim CA
 

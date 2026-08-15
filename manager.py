@@ -816,6 +816,50 @@ def next_bot_name():
     return f"ub{i}"
 
 
+def account_bot_name(me, fallback):
+    """Label dari akunnya sendiri (@username / 4 digit terakhir nomor), biar
+    `ub1` vs `ub2` nggak bikin salah tebak akun mana yang lagi diatur."""
+    base = re.sub(r"[^A-Za-z0-9_]", "", (getattr(me, "username", None) or "").strip())
+    if not base:
+        digits = re.sub(r"\D", "", str(getattr(me, "phone", "") or ""))
+        base = f"akun{digits[-4:]}" if digits else ""
+    if not base or base == "all":
+        return fallback
+    used = {b.name for b in FLEET} | set(PENDING_LOGINS) - {fallback}
+    if base not in used:
+        return base
+    i = 2
+    while f"{base}{i}" in used:
+        i += 1
+    return f"{base}{i}"
+
+
+async def join_chat(client, ref):
+    """Gabung ke channel/group publik pakai @username atau link t.me.
+    -> (ok, judul atau alasan gagal)"""
+    try:                                  # diimpor di sini biar impor modul tetep ringan
+        from telethon.tl.functions.channels import JoinChannelRequest
+        from telethon.tl.functions.messages import ImportChatInviteRequest
+    except Exception as e:
+        return False, f"telethon nggak lengkap: {e}"
+    s = str(ref).strip()
+    m = re.search(r"(?:joinchat/|\+)([A-Za-z0-9_-]+)$", s)
+    try:
+        if m:                             # link invite privat
+            await client(ImportChatInviteRequest(m.group(1)))
+            return True, s
+        ent = await client.get_entity(s)
+        await client(JoinChannelRequest(ent))
+        return True, getattr(ent, "title", None) or s
+    except FloodWaitError as e:
+        return False, f"kena limit Telegram, tunggu {e.seconds}s"
+    except Exception as e:
+        msg = str(e)
+        if "ALREADY" in msg.upper() or "USER_ALREADY_PARTICIPANT" in msg.upper():
+            return True, s                # udah join — anggep sukses
+        return False, f"{type(e).__name__}: {msg[:80]}"
+
+
 def map_plain_text(raw):
     """Plain message -> the command it stands for, or None to ignore."""
     raw = (raw or "").strip()
@@ -1246,7 +1290,7 @@ def to_botapi_markup(rows):
 
 # Commands whose first argument is a bot name — see the auto-fill in on_cmd().
 BOT_ARG_CMDS = {
-    "bot", "auto", "listchannels", "addsource", "delsource", "clearsource", "sources",
+    "bot", "auto", "join", "listchannels", "addsource", "delsource", "clearsource", "sources",
     "listgroups",
     "allow", "unallow", "groups", "mode", "titlefilter", "target", "batch", "cap",
     "quiet", "delay", "dryrun", "pause", "resume", "reload", "preview", "template",
@@ -1274,6 +1318,7 @@ HELP = (
     "`/addsource <bot> <#1,3 | @ch>` · `/delsource <bot> <#1,3 | @ch>`\n"
     "`/addsource <bot> @ch1 @ch2` — tambah langsung pakai @username / link t.me\n"
     "`/clearsource <bot>` — hapus SEMUA source sekaligus\n"
+    "`/join <bot> @ch` — suruh userbot join channel/group dulu\n"
     "`/sources <bot>` — daftar source + tombol mute\n"
     "`/mute <bot> <id>` · `/unmute <bot> <id>` — matiin source sementara\n\n"
     "**Pilih target group/channel**\n"
@@ -1365,6 +1410,7 @@ def register_control(control):
             p = PENDING_LOGINS.pop(name)
             client = p["client"]
             me = await client.get_me()
+            name = account_bot_name(me, name)      # labelnya ikut akunnya
             cfg = new_bot_cfg(name, p["session"])
             FLEET_CONFIG.setdefault("userbots", []).append(cfg)
             b = await attach_userbot(cfg, client)
@@ -2487,6 +2533,15 @@ def register_control(control):
                         entries, errs = [], []
                         for r in refs:
                             ok, title, why = await resolve_source_ref(b, r)
+                            if not ok and not getattr(b, "botmode", False):
+                                # belum join = nggak bakal kebaca pesannya, jadi joinin
+                                jok, jinfo = await join_chat(b.client, r)
+                                if jok:
+                                    ok, title, why = await resolve_source_ref(b, r)
+                                    if ok:
+                                        title = f"{title} — baru di-join"
+                                else:
+                                    why = f"{why}; auto-join gagal ({jinfo})"
                             if ok:
                                 entries.append(r)
                                 resolved[str(r)] = title
@@ -2518,6 +2573,30 @@ def register_control(control):
                             f"`{b.name}` sekarang {len(b.source_ids)} source aktif",
                             [[("📡 Lihat source", f"/sources {b.name}"),
                               ("📋 Pilih lagi", f"/listchannels {b.name}")]])
+
+            elif cmd == "join":
+                bots = find_bots(args[0]) if args else []
+                if not bots or len(args) < 2:
+                    return await reply(
+                        "**Suruh userbot join channel/group**\n"
+                        "`/join <bot> @namachannel` — boleh beberapa sekaligus.\n\n"
+                        "_Userbot cuma bisa baca & kirim di chat yang dia **udah join**. "
+                        "Link invite privat (`t.me/+...`) juga bisa._")
+                b = bots[0]
+                if getattr(b, "botmode", False):
+                    return await reply("mode bot nggak bisa join sendiri — "
+                                       f"add @{BOT_USERNAME or 'botnya'} manual ke chatnya")
+                lines = []
+                for raw_ref in args[1:]:
+                    ref = normalize_source_ref(raw_ref)
+                    ok, info = await join_chat(b.client, ref)
+                    lines.append(("✅ " if ok else "❌ ") + f"`{ref}` — {info}")
+                    if ok:
+                        await asyncio.sleep(1)     # jangan nyerbu, gampang kena limit
+                await b.refresh_targets()
+                await reply(f"**{b.name} join:**\n" + "\n".join(lines),
+                            [[("📡 Jadiin source", f"/listchannels {b.name}"),
+                              ("🎯 Jadiin target", f"/listgroups {b.name}")]])
 
             elif cmd == "clearsource":
                 bots = find_bots(args[0]) if args else []
@@ -2708,6 +2787,7 @@ BOT_COMMANDS = [
     ("addsource", "Tambah source — /addsource <bot> #1,3"),
     ("delsource", "Hapus source — /delsource <bot> #1"),
     ("clearsource", "Hapus SEMUA source — /clearsource <bot>"),
+    ("join", "Suruh userbot join channel — /join <bot> @nama"),
     ("sources", "Daftar source + tombol mute"),
     ("mute", "Matiin source sementara — /mute <bot> <id>"),
     ("unmute", "Nyalain lagi — /unmute <bot> <id>"),
