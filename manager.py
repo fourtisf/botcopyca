@@ -377,6 +377,15 @@ def dialog_matches(d, entry):
     return s.lower() in title.lower()
 
 
+def enable_target_kind(fil, d):
+    """Milih channel sebagai target = otomatis ngizinin channel. Tanpa ini,
+    pilihannya kesimpen tapi kesaring lagi pas resolve."""
+    if d.is_channel and not d.is_group:
+        fil["include_channels"] = True
+    else:
+        fil["include_groups"] = True
+
+
 def target_kind_ok(d, fil):
     """send_filter decides which dialog kinds can be targets at all."""
     is_broadcast = d.is_channel and not d.is_group
@@ -489,7 +498,9 @@ async def collect_dialogs(bot, kind, keyword=None):
         if kind == "channel" and not is_broadcast:
             continue
         if kind == "group":
-            if not target_kind_ok(d, fil) or d.id in bot.source_ids:
+            # tampilkan SEMUA yang udah di-join (group + channel) biar kedeteksi
+            # otomatis; include_* baru diset pas ada yang dipilih
+            if not (d.is_group or d.is_channel) or d.id in bot.source_ids:
                 continue
         if keyword:
             k = keyword.lower()
@@ -508,8 +519,9 @@ def render_picker(b, kind, dialogs, keyword=None):
     what = "source channel" if kind == "channel" else "target"
     rows = []
     for i, d in enumerate(dialogs[:MAX_PICK], start=1):
-        title = (getattr(d.entity, "title", "?") or "?")[:26]
-        rows.append([(f"{'✅' if d.id in chosen else '▫️'} {title}", f"/{tog} {b.name} {i}")])
+        title = (getattr(d.entity, "title", "?") or "?")[:24]
+        badge = "" if kind == "channel" else ("📢 " if d.is_channel and not d.is_group else "👥 ")
+        rows.append([(f"{'✅' if d.id in chosen else '▫️'} {badge}{title}", f"/{tog} {b.name} {i}")])
     rows.append([("🔄 Refresh", f"/list{'channels' if kind == 'channel' else 'groups'} {b.name}"
                   + (f" {keyword}" if keyword else "")),
                  ("✅ Selesai", f"/bot {b.name}")])
@@ -1025,6 +1037,8 @@ def menu_bot(b):
         [("📡 Source", f"/listchannels {b.name}"), ("🎯 Target", f"/listgroups {b.name}")],
         [("👁 Preview", f"/preview {b.name}"), ("🧪 Test CA", f"/testca {b.name}")],
         [("🔧 Test kirim", f"/test {b.name}"), ("🔄 Reload", f"/reload {b.name}")],
+        [(f"⏱ {s}s" + (" ✓" if b.cfg.get("delay_between_groups_sec", 5) == s else ""),
+          f"/delay {b.name} {s}") for s in (3, 5, 10, 20)],
         [("📜 Riwayat", "/last"), ("⬅️ Balik", "/bots")],
     ]
 
@@ -1213,10 +1227,15 @@ def register_control(control):
                 dry = fil.get("dry_run", False)
                 state = "⏸ paused" if b.paused else ("🧪 dry-run" if dry else "▶️ live")
                 c = b.counters
+                n_grp = sum(1 for d in b.targets if d.is_group)
+                n_ch = len(b.targets) - n_grp
                 txt = (
                     f"**{b.name}** — {state}\n\n"
                     f"📡 source: {len(b.source_ids)}\n"
-                    f"🎯 target: {len(b.targets)} ({'group+channel' if fil.get('include_channels') and fil.get('include_groups', True) else 'channel' if fil.get('include_channels') else 'group'})\n"
+                    f"🎯 target: {len(b.targets)}"
+                    + (f" (👥 {n_grp} group · 📢 {n_ch} channel)" if n_ch else
+                       f" (👥 {n_grp} group)" if n_grp else "")
+                    + "\n"
                     f"⛓ chain: {', '.join(b.cfg.get('chains', []))}\n"
                     f"🔁 dedup: {b.cfg.get('dedup_hours', 0) or 'selamanya'}\n"
                     f"⏱ delay: {b.cfg.get('delay_between_groups_sec', 5)}s"
@@ -1831,6 +1850,7 @@ def register_control(control):
                         al[:] = [x for x in al if not dialog_matches(d, x)]
                     else:
                         al.append(d.id)
+                        enable_target_kind(fil, d)   # channel/group nyala sendiri
                     if fil.get("mode", "allowlist") != "allowlist":
                         fil["mode"] = "allowlist"   # tap = maksudnya milih manual
                     await b.refresh_targets()
@@ -2089,6 +2109,9 @@ def register_control(control):
                     if bad:
                         return await reply(f"nomor nggak valid: {', '.join(bad)}")
                     entry_vals = [d.id for d in picked]     # id = paling stabil
+                    if cmd == "allow":
+                        for d in picked:
+                            enable_target_kind(b.cfg.setdefault("send_filter", {}), d)
                 else:
                     entry = " ".join(rest)
                     entry_vals = [int(entry) if entry.lstrip("-").isdigit() else entry]
