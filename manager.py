@@ -29,6 +29,8 @@ import re
 import sqlite3
 import sys
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import base58
@@ -56,22 +58,20 @@ DB_PATH = BASE / "callrelay.db"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("manager")
 
-# Fail with one readable line instead of a traceback loop under pm2.
 GET_CREDS = ("Ambil api_id + api_hash di https://my.telegram.org "
              "(login → API development tools), terus isi ke .env. Lihat HANDOFF.md")
 
-if not API_ID_RAW.isdigit():
-    raise SystemExit(
-        f"API_ID di .env bukan angka (isinya sekarang: {API_ID_RAW!r}). {GET_CREDS}"
-    )
-API_ID = int(API_ID_RAW)
+# Userbots talk MTProto and need api_id/api_hash. The control bot doesn't:
+# without valid creds we still bring it up over the plain Bot API (token only),
+# so the console answers and can explain what is missing.
+CREDS_OK = bool(API_ID_RAW.isdigit() and re.fullmatch(r"[0-9a-fA-F]{32}", API_HASH))
+API_ID = int(API_ID_RAW) if API_ID_RAW.isdigit() else 0
 
-if not re.fullmatch(r"[0-9a-fA-F]{32}", API_HASH):
+if not CREDS_OK and not CONTROL_BOT_TOKEN:
     raise SystemExit(
-        f"API_HASH di .env bukan hash 32 karakter (isinya sekarang: {API_HASH!r}). {GET_CREDS}"
+        f"API_ID/API_HASH di .env belum valid (API_ID={API_ID_RAW!r}, API_HASH={API_HASH!r}) "
+        f"dan CONTROL_BOT_TOKEN juga kosong — nggak ada yang bisa dijalanin. {GET_CREDS}"
     )
-if not CONTROL_BOT_TOKEN and not FLEET_PATH.exists():
-    raise SystemExit("CONTROL_BOT_TOKEN kosong dan fleet.json nggak ada — see HANDOFF.md")
 if not FLEET_PATH.exists():
     raise SystemExit("fleet.json not found — see HANDOFF.md")
 
@@ -666,7 +666,9 @@ def register_control(control):
         if event.sender_id not in ADMIN_IDS:
             return  # silently ignore non-admins
         parts = (event.raw_text or "").split()
-        cmd = parts[0].lower().lstrip("/")
+        if not parts:
+            return
+        cmd = parts[0].lower().lstrip("/").split("@")[0]   # /status@mybot -> status
         args = parts[1:]
 
         async def reply(msg):
@@ -698,6 +700,14 @@ def register_control(control):
 
             # ---------------------------------------------------- add account by phone
             elif cmd in ("addnumber", "addbot"):
+                if not CREDS_OK:
+                    return await reply(
+                        "⚠️ **Mode terbatas** — `/addnumber` belum bisa dipakai.\n\n"
+                        "Nambah userbot itu login akun Telegram beneran, dan itu butuh "
+                        "`API_ID` + `API_HASH` di `.env` (bukan token bot).\n\n"
+                        "Ambil di https://my.telegram.org → *API development tools*, "
+                        "isi ke `.env`, terus `pm2 restart callrelay`."
+                    )
                 if len(args) < 2:
                     return await reply("usage: `/addnumber <name> <+62812xxxx>`")
                 name, phone = args[0], "".join(args[1:])
@@ -915,6 +925,17 @@ def register_control(control):
 
             elif cmd == "status":
                 lines = [f"**Fleet status** — jam server {time.strftime('%H:%M')}"]
+                if not CREDS_OK:
+                    lines += [
+                        "",
+                        "⚠️ **MODE TERBATAS** — `API_ID`/`API_HASH` di `.env` belum diisi.",
+                        "Control bot jalan (lo lagi ngobrol sama gue), tapi userbot belum bisa:",
+                        "relay CA dan `/addnumber` butuh api_id dari my.telegram.org.",
+                        "Yang udah bisa dicoba sekarang: `/help`, `/status`, `/stats`.",
+                        "",
+                    ]
+                if not FLEET:
+                    lines.append("_belum ada userbot_")
                 for b in FLEET:
                     dry = b.cfg.get("send_filter", {}).get("dry_run", False)
                     state = "⏸ paused" if b.paused else ("🧪 dry" if dry else "▶️ live")
@@ -1099,6 +1120,109 @@ def register_control(control):
             await reply(f"error: `{e}`")
 
 
+# ---------------------------------------------------------------- Bot API fallback console
+
+class BotApiControl:
+    """Control bot over the plain HTTP Bot API — token only, no api_id.
+
+    Used when API_ID/API_HASH are missing so the console still answers and can
+    say what is missing. Userbots are unaffected: they need MTProto either way.
+    Exposes just enough of the Telethon surface (.on / .get_me / .run_until_disconnected)
+    for register_control() to work unchanged.
+    """
+
+    def __init__(self, token):
+        self.token = token
+        self.handler = None
+        self.offset = 0
+        self.me = {}
+
+    # --- telethon-shaped bits ------------------------------------------------
+    def on(self, _event):
+        def deco(fn):
+            self.handler = fn
+            return fn
+        return deco
+
+    async def get_me(self):
+        return types_ns(username=self.me.get("username"), first_name=self.me.get("first_name"))
+
+    # --- http ---------------------------------------------------------------
+    def _post(self, method, params, timeout):
+        url = f"https://api.telegram.org/bot{self.token}/{method}"
+        data = urllib.parse.urlencode(params).encode()
+        with urllib.request.urlopen(url, data=data, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+
+    async def call(self, method, http_timeout=15, **params):
+        return await asyncio.to_thread(self._post, method, params, http_timeout)
+
+    async def send(self, chat_id, text):
+        try:
+            r = await self.call("sendMessage", chat_id=chat_id, text=text,
+                                parse_mode="Markdown", disable_web_page_preview="true")
+            if r.get("ok"):
+                return
+            log.warning(f"control send rejected: {r.get('description')}")
+        except Exception as e:
+            log.warning(f"control send failed: {e}")
+        try:   # markdown in the payload can trip the parser — resend as plain text
+            await self.call("sendMessage", chat_id=chat_id, text=text,
+                            disable_web_page_preview="true")
+        except Exception as e:
+            log.error(f"control send failed (plain): {e}")
+
+    async def start(self):
+        r = await self.call("getMe")
+        if not r.get("ok"):
+            raise SystemExit(f"CONTROL_BOT_TOKEN ditolak Telegram: {r.get('description')}")
+        self.me = r["result"]
+        return self
+
+    async def run_until_disconnected(self):
+        log.info("control bot polling via Bot API (mode terbatas — tanpa api_id)")
+        while True:
+            try:
+                r = await self.call("getUpdates", http_timeout=70, offset=self.offset,
+                                    timeout=50, allowed_updates='["message"]')
+            except Exception as e:
+                log.warning(f"getUpdates failed: {e}")
+                await asyncio.sleep(5)
+                continue
+            for upd in r.get("result", []):
+                self.offset = upd["update_id"] + 1
+                msg = upd.get("message") or {}
+                text = msg.get("text") or ""
+                if not text.startswith("/") or not self.handler:
+                    continue
+                try:
+                    await self.handler(BotApiEvent(self, msg, text))
+                except Exception as e:
+                    log.error(f"control handler error: {e}")
+
+
+class BotApiEvent:
+    """Telethon-event lookalike for the Bot API path."""
+
+    def __init__(self, ctrl, msg, text):
+        self._ctrl = ctrl
+        self._chat = msg["chat"]["id"]
+        self.raw_text = text
+        self.sender_id = (msg.get("from") or {}).get("id")
+
+    async def reply(self, text, **_kw):
+        await self._ctrl.send(self._chat, text)
+
+
+def types_ns(**kw):
+    class _NS:
+        pass
+    ns = _NS()
+    for k, v in kw.items():
+        setattr(ns, k, v)
+    return ns
+
+
 # ---------------------------------------------------------------- --list-groups
 
 async def list_groups(session):
@@ -1121,31 +1245,49 @@ async def list_groups(session):
 # ---------------------------------------------------------------- boot
 
 async def main():
-    # start each userbot listed in fleet.json (more can be added live via /addnumber)
-    for cfg in USERBOT_CFGS:
-        client = TelegramClient(str(BASE / cfg["session"]), API_ID, API_HASH)
-        await client.start()  # interactive first run per session
-        me = await client.get_me()
-        log.info(f"[{cfg['name']}] logged in as {me.first_name} (@{me.username})")
-        b = await attach_userbot(cfg, client)
-        log.info(f"[{b.name}] {len(b.source_ids)} sources -> {len(b.targets)} groups "
-                 f"(mode={cfg.get('send_filter',{}).get('mode')} "
-                 f"dry={cfg.get('send_filter',{}).get('dry_run')})")
+    if not CREDS_OK:
+        log.warning("=" * 70)
+        log.warning("API_ID/API_HASH di .env belum valid — MODE TERBATAS.")
+        log.warning("Control bot tetep nyala (Bot API) dan bakal bales chat lo,")
+        log.warning("tapi userbot belum bisa jalan: relay & /addnumber butuh api_id.")
+        log.warning(GET_CREDS)
+        log.warning("=" * 70)
 
-    # start control bot
+    # start each userbot listed in fleet.json (more can be added live via /addnumber)
+    if CREDS_OK:
+        for cfg in USERBOT_CFGS:
+            client = TelegramClient(str(BASE / cfg["session"]), API_ID, API_HASH)
+            await client.start()  # interactive first run per session
+            me = await client.get_me()
+            log.info(f"[{cfg['name']}] logged in as {me.first_name} (@{me.username})")
+            b = await attach_userbot(cfg, client)
+            log.info(f"[{b.name}] {len(b.source_ids)} sources -> {len(b.targets)} groups "
+                     f"(mode={cfg.get('send_filter',{}).get('mode')} "
+                     f"dry={cfg.get('send_filter',{}).get('dry_run')})")
+    elif USERBOT_CFGS:
+        log.warning(f"{len(USERBOT_CFGS)} userbot di fleet.json dilewatin (butuh api_id)")
+
+    # start control bot — Telethon when we have creds, Bot API when we don't
     control = None
     if CONTROL_BOT_TOKEN:
-        control = await TelegramClient(str(BASE / "control_bot"), API_ID, API_HASH).start(bot_token=CONTROL_BOT_TOKEN)
+        if CREDS_OK:
+            control = await TelegramClient(str(BASE / "control_bot"), API_ID,
+                                           API_HASH).start(bot_token=CONTROL_BOT_TOKEN)
+        else:
+            control = await BotApiControl(CONTROL_BOT_TOKEN).start()
         register_control(control)
         me = await control.get_me()
         log.info(f"control bot live: @{me.username} (admins: {sorted(ADMIN_IDS)})")
     else:
         log.warning("No CONTROL_BOT_TOKEN — running without control bot; /addnumber unavailable")
 
-    log.info(f"CALLRELAY MANAGER up — {len(FLEET)} userbots")
+    log.info(f"CALLRELAY MANAGER up — {len(FLEET)} userbots"
+             + ("" if CREDS_OK else "  [MODE TERBATAS — nunggu api_id]"))
     runners = [b.runner for b in FLEET]
     if control:
         runners.append(asyncio.create_task(control.run_until_disconnected()))
+    if not runners:
+        raise SystemExit("nggak ada userbot dan nggak ada control bot — cek .env & fleet.json")
     await asyncio.gather(*runners)
 
 
