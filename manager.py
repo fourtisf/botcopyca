@@ -902,16 +902,28 @@ def screen_start():
 
     text = (
         "🚀 **CALLRELAY**\n"
-        "_Relay contract address dari channel call ke group lo — otomatis, 24 jam._\n\n"
-        "```\n"
-        "pantau channel  →  ambil CA  →  buang duplikat  →  kirim ke group\n"
-        "```\n"
-        f"**Status:** {state}\n\n"
+        "Relay contract address dari channel call ke group lo — otomatis, 24 jam.\n\n"
+        "📡 Pantau channel\n"
+        "🔍 Ambil CA (SOL & EVM, termasuk yang ngumpet di link/tombol)\n"
+        "🚫 Buang duplikat\n"
+        "📤 Kirim ke group lo\n\n"
+        f"**Status:** {state}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "**✨ Yang bisa dilakuin**\n\n"
+        "🤖 **Multi-akun** — banyak userbot, satu proses, diatur dari chat ini\n"
+        "📡 **Multi-source** — pantau banyak channel sekaligus\n"
+        "🎯 **Target bebas** — group atau channel, dipilih pakai nomor\n"
+        "🛡 **Anti-spam** — kumpulin CA jadi 1 recap, batas harian, jam tenang\n"
+        "✏️ **Format sendiri** — template pesan bisa diganti\n"
+        "📊 **Statistik** — riwayat CA, ranking source, counter\n"
+        "🧪 **Mode aman** — dry-run dulu, live belakangan\n"
+        "🔇 **Mute source** — matiin channel berisik tanpa ngehapus\n"
+        "━━━━━━━━━━━━━━━━━━\n"
         f"➡️ **Langkah lo sekarang: {judul}**\n{detail}"
     )
     return text, [
         [(blabel, bcmd), ("📖 Panduan", "/panduan")],
-        [("📋 Menu", "/menu"), ("❓ Command", "/help")],
+        [("📋 Menu", "/menu"), ("❓ Semua command", "/help")],
     ]
 
 
@@ -2023,6 +2035,15 @@ def register_control(control):
 
 # ---------------------------------------------------------------- Bot API fallback console
 
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.S)
+
+
+def md_to_legacy(text):
+    """Telethon writes **bold**; the Bot API's Markdown wants *bold*.
+    Without this every heading came out with stray asterisks."""
+    return _BOLD_RE.sub(r"*\1*", text)
+
+
 def botapi_post(token, method, params, timeout=30):
     url = f"https://api.telegram.org/bot{token}/{method}"
     data = urllib.parse.urlencode(params).encode()
@@ -2144,6 +2165,7 @@ class BotApiControl:
 
     async def send_checked(self, chat_id, text):
         """Like send() but reports failure, so the relay can count it."""
+        text = md_to_legacy(text)
         try:
             r = await self.call("sendMessage", chat_id=chat_id, text=text,
                                 parse_mode="Markdown", disable_web_page_preview="true")
@@ -2160,6 +2182,7 @@ class BotApiControl:
             return False
 
     async def send(self, chat_id, text, buttons=None):
+        text = md_to_legacy(text)
         extra = {"reply_markup": to_botapi_markup(buttons)} if buttons else {}
         try:
             r = await self.call("sendMessage", chat_id=chat_id, text=text,
