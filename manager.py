@@ -1047,8 +1047,8 @@ def onboarding_step():
                 f"`/listgroups {b.name}` → `/allow {b.name} #1,2`",
                 "🎯 Pilih target", f"/listgroups {b.name}")
     if b.cfg.get("send_filter", {}).get("dry_run", True):
-        return ("Uji dulu, baru live",
-                f"`/testca {b.name}` buat nyoba · kalau udah oke `/dryrun {b.name} off`",
+        return ("Uji dulu, baru nyalain",
+                f"`/testca {b.name}` buat nyoba · kalau udah oke nyalain di `/auto {b.name}`",
                 "🧪 Test CA", f"/testca {b.name}")
     return ("Udah jalan ▶️",
             f"{len(b.source_ids)} source → {len(b.targets)} target. Pantau lewat `/status`.",
@@ -1097,13 +1097,11 @@ def screen_start():
         rows.append([("📡 Channel sumber", f"/listchannels {n}"),
                      ("🎯 Group tujuan", f"/listgroups {n}")])
     rows += [
-        [("📊 Status", "/status"), ("📈 Stats", "/stats")],
+        # sengaja dipendekin: satu tombol per pekerjaan. Sisanya lewat /menu.
+        [("📊 Status", "/status"), ("🛡 Anti-spam", "/antispam")],
         [("🤖 Userbot", "/bots"),
          ("➕ Tambah akun", "/addnumber") if CREDS_OK else ("📋 Chat bot", "/chats")],
-        [("🛡 Anti-spam", "/antispam"), ("📜 Riwayat", "/last")],
-        [("🏆 Top source", "/top"), ("🩺 Info", "/version")],
-        [("📖 Panduan", "/panduan"), ("❓ Semua command", "/help")],
-        [("📋 Menu", "/menu"), ("🏓 Ping", "/ping")],
+        [("📖 Panduan", "/panduan"), ("📋 Menu lengkap", "/menu")],
     ]
     seen, out = {bcmd}, [rows[0]]                            # buang tombol dobel
     for row in rows[1:]:
@@ -1138,23 +1136,29 @@ PANDUAN = (
 
 
 def menu_main():
-    return [
+    """Yang jarang dipakai ngumpul di sini, biar /start tetep pendek."""
+    rows = []
+    if FLEET:
+        n = FLEET[0].name
+        rows.append([("🚀 Auto kirim CA", f"/auto {n}")])
+    rows += [
         [("📊 Status", "/status"), ("📈 Stats", "/stats")],
-        [("🤖 Userbot", "/bots"), ("📋 Chat bot", "/chats")],
-        [("🛡 Anti-spam", "/antispam"), ("📜 Riwayat", "/last")],
+        [("🤖 Userbot", "/bots"), ("🛡 Anti-spam", "/antispam")],
+        [("📜 Riwayat", "/last"), ("🏆 Top source", "/top")],
         [("❓ Command", "/help"), ("🩺 Info", "/version")],
     ]
+    return rows
 
 
 def menu_bot(b):
+    """Satu fungsi = satu tombol. Saklar hidup/mati cuma di `/auto`, tes cuma
+    lewat Test CA — biar nggak ada dua tombol yang kerjanya mirip."""
     dry = b.cfg.get("send_filter", {}).get("dry_run", False)
     return [
         [(("🔴 Auto-kirim MATI" if dry or b.paused else "🟢 Auto-kirim AKTIF"), f"/auto {b.name}")],
-        [("▶️ Resume" if b.paused else "⏸ Pause", f"/{'resume' if b.paused else 'pause'} {b.name}"),
-         ("🚀 Go live" if dry else "🧪 Dry-run", f"/dryrun {b.name} {'off' if dry else 'on'}")],
-        [("📡 Source", f"/listchannels {b.name}"), ("🎯 Target", f"/listgroups {b.name}")],
-        [("👁 Preview", f"/preview {b.name}"), ("🧪 Test CA", f"/testca {b.name}")],
-        [("🔧 Test kirim", f"/test {b.name}"), ("🔄 Reload", f"/reload {b.name}")],
+        [("📡 Channel sumber", f"/listchannels {b.name}"),
+         ("🎯 Group tujuan", f"/listgroups {b.name}")],
+        [("🧪 Test CA", f"/testca {b.name}"), ("🛡 Anti-spam", "/antispam")],
         [(f"⏱ {s}s" + (" ✓" if b.cfg.get("delay_between_groups_sec", 5) == s else ""),
           f"/delay {b.name} {s}") for s in (3, 5, 10, 20)],
         [("📜 Riwayat", "/last"), ("⬅️ Balik", "/bots")],
