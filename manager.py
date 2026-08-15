@@ -469,6 +469,7 @@ def find_bots(selector):
 # ---------------------------------------------------------------- dialog pickers
 
 MAX_LIST = 40    # keep a listing under Telegram's 4096-char message cap
+MAX_PICK = 20    # one tappable row per chat — keyboards get unwieldy past this
 MAX_BATCH = 15   # hard ceiling on CAs per digest, so one message stays readable
 
 
@@ -498,6 +499,27 @@ async def collect_dialogs(bot, kind, keyword=None):
                 continue
         out.append(d)
     return out
+
+
+def render_picker(b, kind, dialogs, keyword=None):
+    """Daftar channel/group sebagai tombol — tap buat pilih/batal."""
+    chosen = b.source_ids if kind == "channel" else {d.id for d in b.targets}
+    tog = "togsrc" if kind == "channel" else "togtgt"
+    what = "source channel" if kind == "channel" else "target"
+    rows = []
+    for i, d in enumerate(dialogs[:MAX_PICK], start=1):
+        title = (getattr(d.entity, "title", "?") or "?")[:26]
+        rows.append([(f"{'✅' if d.id in chosen else '▫️'} {title}", f"/{tog} {b.name} {i}")])
+    rows.append([("🔄 Refresh", f"/list{'channels' if kind == 'channel' else 'groups'} {b.name}"
+                  + (f" {keyword}" if keyword else "")),
+                 ("✅ Selesai", f"/bot {b.name}")])
+    n_on = len([d for d in dialogs[:MAX_PICK] if d.id in chosen])
+    head = (f"**Pilih {what}** — `{b.name}`"
+            + (f" · filter `{keyword}`" if keyword else "")
+            + f"\n{n_on} dari {len(dialogs)} kepilih. Tap buat pilih / batal.")
+    if len(dialogs) > MAX_PICK:
+        head += f"\n_{len(dialogs) - MAX_PICK} lagi nggak muat — persempit pakai keyword_"
+    return head, rows
 
 
 def render_listing(dialogs, chosen_ids):
@@ -1026,8 +1048,18 @@ def to_botapi_markup(rows):
     ]})
 
 
+# Commands whose first argument is a bot name — see the auto-fill in on_cmd().
+BOT_ARG_CMDS = {
+    "bot", "listchannels", "addsource", "delsource", "sources", "listgroups",
+    "allow", "unallow", "groups", "mode", "titlefilter", "target", "batch", "cap",
+    "quiet", "delay", "dryrun", "pause", "resume", "reload", "preview", "template",
+    "attribution", "chains", "dedup", "dedupreset", "test", "testca", "broadcast",
+    "stats", "mute", "unmute", "block", "unblock", "resetstats", "togsrc", "togtgt",
+}
+
 HELP = (
     "**CALLRELAY control**\n"
+    "_Kalau cuma ada 1 userbot, nama botnya boleh dilewat: `/allow #1,2`_\n"
     "_tap `/menu` buat versi tombol_\n\n"
     "**Akun**\n"
     "**Kirim nomornya aja** (`+628...`) buat nambah userbot — nggak usah command.\n"
@@ -1100,6 +1132,13 @@ def register_control(control):
         args = parts[1:]
         if not cmd:                                        # a bare "/" — show the menu
             cmd = "menu"
+
+        # With a single userbot the name is noise: /allow #1,2 means the same as
+        # /allow ub1 #1,2. Only fill it in when the first word isn't already a bot.
+        if cmd in BOT_ARG_CMDS and len(FLEET) == 1:
+            only = FLEET[0].name
+            if not args or (args[0] != "all" and not find_bots(args[0])):
+                args = [only] + args
 
         async def reply(msg, buttons=None):
             kw = {}
@@ -1759,13 +1798,45 @@ def register_control(control):
                 if not dialogs:
                     return await reply(f"`{b.name}` nggak punya {kind} yang cocok"
                                        + (f" sama `{keyword}`" if keyword else ""))
-                chosen = b.source_ids if kind == "channel" else {d.id for d in b.targets}
-                head = (f"**{b.name} — {kind} ({len(dialogs)})**"
-                        + (f" filter `{keyword}`" if keyword else "")
-                        + "\n✅ = udah kepilih\n")
-                pick = (f"`/addsource {b.name} #1,3`" if kind == "channel"
-                        else f"`/allow {b.name} #1,3`")
-                await reply(head + "\n".join(render_listing(dialogs, chosen)) + f"\n\npilih: {pick}")
+                head, rows = render_picker(b, kind, dialogs, keyword)
+                await reply(head, rows)
+
+            elif cmd in ("togsrc", "togtgt"):
+                kind = "channel" if cmd == "togsrc" else "group"
+                bots = find_bots(args[0]) if args else []
+                if not bots or len(args) < 2 or not args[1].isdigit():
+                    return await reply(f"usage: `/{cmd} <bot> <nomor>` — biasanya cukup tap "
+                                       f"tombol dari `/list{'channels' if kind == 'channel' else 'groups'}`")
+                b = bots[0]
+                listing = b.listing[kind][:MAX_PICK]
+                i = int(args[1])
+                if not 1 <= i <= len(listing):
+                    return await reply("nomornya udah nggak cocok — tap 🔄 Refresh dulu")
+                d = listing[i - 1]
+
+                if cmd == "togsrc":
+                    srcs = b.cfg.setdefault("source_channels", [])
+                    ref = d.id if getattr(b, "botmode", False) else dialog_ref(d)
+                    if d.id in b.source_ids:
+                        srcs[:] = [x for x in srcs
+                                   if str(x) != str(ref) and str(x) != str(d.id)]
+                    elif ref not in srcs:
+                        srcs.append(ref)
+                    await b.refresh_sources()
+                    await b.refresh_targets()      # source nggak boleh jadi target
+                else:
+                    fil = b.cfg.setdefault("send_filter", {})
+                    al = fil.setdefault("allowlist", [])
+                    if any(dialog_matches(d, e) for e in al):
+                        al[:] = [x for x in al if not dialog_matches(d, x)]
+                    else:
+                        al.append(d.id)
+                    if fil.get("mode", "allowlist") != "allowlist":
+                        fil["mode"] = "allowlist"   # tap = maksudnya milih manual
+                    await b.refresh_targets()
+                save_fleet()
+                head, rows = render_picker(b, kind, b.listing[kind])
+                await reply(head, rows)
 
             # ---------------------------------------------------- anti-spam knobs
             elif cmd == "batch":
