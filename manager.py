@@ -1093,6 +1093,7 @@ def screen_start():
     rows = [[(blabel, bcmd)]]                                # langkah berikutnya, selebar layar
     if FLEET:                                                # pilih source & target langsung
         n = FLEET[0].name
+        rows.append([("🚀 Auto kirim CA", f"/auto {n}")])
         rows.append([("📡 Channel sumber", f"/listchannels {n}"),
                      ("🎯 Group tujuan", f"/listgroups {n}")])
     rows += [
@@ -1148,6 +1149,7 @@ def menu_main():
 def menu_bot(b):
     dry = b.cfg.get("send_filter", {}).get("dry_run", False)
     return [
+        [(("🔴 Auto-kirim MATI" if dry or b.paused else "🟢 Auto-kirim AKTIF"), f"/auto {b.name}")],
         [("▶️ Resume" if b.paused else "⏸ Pause", f"/{'resume' if b.paused else 'pause'} {b.name}"),
          ("🚀 Go live" if dry else "🧪 Dry-run", f"/dryrun {b.name} {'off' if dry else 'on'}")],
         [("📡 Source", f"/listchannels {b.name}"), ("🎯 Target", f"/listgroups {b.name}")],
@@ -1180,7 +1182,8 @@ def to_botapi_markup(rows):
 
 # Commands whose first argument is a bot name — see the auto-fill in on_cmd().
 BOT_ARG_CMDS = {
-    "bot", "listchannels", "addsource", "delsource", "clearsource", "sources", "listgroups",
+    "bot", "auto", "listchannels", "addsource", "delsource", "clearsource", "sources",
+    "listgroups",
     "allow", "unallow", "groups", "mode", "titlefilter", "target", "batch", "cap",
     "quiet", "delay", "dryrun", "pause", "resume", "reload", "preview", "template",
     "attribution", "chains", "dedup", "dedupreset", "test", "testca", "broadcast",
@@ -1198,6 +1201,9 @@ HELP = (
     "`/addnumber <+62...>` · `/pass <2fa>` · `/cancel <name>`\n"
     "`/bots` — daftar userbot · `/bot <name>` — panel satu userbot\n"
     "`/delbot <name>` — copot userbot dari fleet\n\n"
+    "**Auto kirim CA**\n"
+    "`/auto <bot>` — panel on/off + pilih source & group tujuan\n"
+    "`/auto <bot> on|off` — nyalain / matiin auto-kirim\n\n"
     "**Pilih source channel**\n"
     "`/listchannels <bot> [keyword]` — channel yang di-join, bernomor\n"
     "`/addsource <bot> <#1,3 | @ch>` · `/delsource <bot> <#1,3 | @ch>`\n"
@@ -1372,6 +1378,50 @@ def register_control(control):
                     + f"\n\n📊 relayed {c['relayed']} · dup {c['dup_skips']} · ok {c['sends_ok']} · fail {c['sends_fail']}"
                 )
                 await reply(txt, menu_bot(b))
+
+            elif cmd == "auto":
+                bots = find_bots(args[0]) if args else []
+                if not bots:
+                    return await reply("usage: `/auto <bot> [on|off]`")
+                b = bots[0]
+                fil = b.cfg.setdefault("send_filter", {})
+                if len(args) > 1 and args[1] in ("on", "off"):
+                    fil["dry_run"] = args[1] == "off"
+                    if args[1] == "on":
+                        b.paused = False
+                    save_fleet()
+                live = not fil.get("dry_run", False) and not b.paused
+                n_grp = sum(1 for d in b.targets if d.is_group)
+                n_ch = len(b.targets) - n_grp
+                blockers = []
+                if not b.source_ids:
+                    blockers.append(f"belum ada channel sumber — `/listchannels {b.name}`")
+                if not b.targets:
+                    blockers.append(f"belum ada group tujuan — `/listgroups {b.name}`")
+                txt = (
+                    f"🚀 **Auto kirim CA** — `{b.name}`\n\n"
+                    f"Status: {'🟢 **AKTIF**' if live else '🔴 **MATI**'}"
+                    + ("" if live else " _(cuma dibaca, nggak dikirim)_") + "\n"
+                    f"📡 Dari: **{len(b.source_ids)}** channel\n"
+                    f"🎯 Ke: **{len(b.targets)}** chat"
+                    + (f" (👥 {n_grp} group · 📢 {n_ch} channel)" if n_ch else
+                       f" (👥 {n_grp} group)" if n_grp else "") + "\n"
+                    f"⏱ Jeda antar group: {b.cfg.get('delay_between_groups_sec', 5)}s"
+                    + (f" · batch {b.cfg['batch_window_sec'] // 60}m" if b.cfg.get("batch_window_sec") else "")
+                    + (f" · max {b.cfg['max_per_day_per_group']}/group/hari" if b.cfg.get("max_per_day_per_group") else "")
+                    + "\n\nAlurnya: channel sumber ada CA baru → dicek duplikat → "
+                      "dikirim ke tiap group tujuan, otomatis 24 jam."
+                )
+                if blockers:
+                    txt += "\n\n⚠️ _Belum jalan: " + "; ".join(blockers) + "_"
+                rows = [[("🔴 Matiin auto-kirim" if live else "🟢 Nyalain auto-kirim",
+                          f"/auto {b.name} {'off' if live else 'on'}")],
+                        [("📡 Pilih channel sumber", f"/listchannels {b.name}"),
+                         ("🎯 Pilih group tujuan", f"/listgroups {b.name}")],
+                        [("🧪 Tes kirim sekarang", f"/testca {b.name}"),
+                         ("👁 Contoh pesan", f"/preview {b.name}")],
+                        [("🛡 Anti-spam", "/antispam"), ("⬅️ Balik", f"/bot {b.name}")]]
+                await reply(txt, rows)
 
             elif cmd == "here":
                 chat = getattr(event, "chat", None) or {}
@@ -2477,6 +2527,7 @@ BOT_COMMANDS = [
     ("chats", "Chat yang kebaca bot"),
     ("here", "Daftarin chat ini (ketik di dalam group)"),
     ("bots", "Daftar userbot"),
+    ("auto", "Auto kirim CA: on/off + pilih group"),
     ("listchannels", "Pilih source channel — /listchannels <bot>"),
     ("addsource", "Tambah source — /addsource <bot> #1,3"),
     ("delsource", "Hapus source — /delsource <bot> #1"),
@@ -2582,6 +2633,29 @@ class BotApiControl:
         except Exception:
             return False
 
+    async def edit(self, chat_id, message_id, text, buttons=None):
+        """Tulis ulang pesan yang tombolnya baru ditap, biar centangnya nggak basi.
+
+        Balik False kalau nggak bisa (pesan kelamaan, dsb) — pemanggilnya
+        tinggal kirim pesan baru.
+        """
+        text = md_to_legacy(text)
+        extra = {"reply_markup": to_botapi_markup(buttons)} if buttons else {}
+        try:
+            r = await self.call("editMessageText", chat_id=chat_id, message_id=message_id,
+                                text=text, parse_mode="Markdown",
+                                disable_web_page_preview="true", **extra)
+        except Exception as e:
+            log.warning(f"edit failed: {e}")
+            return False
+        if r.get("ok"):
+            return True
+        desc = r.get("description", "")
+        if "not modified" in desc:
+            return True            # udah sama persis — nggak usah kirim ulang
+        log.warning(f"edit rejected: {desc}")
+        return False
+
     async def send(self, chat_id, text, buttons=None):
         text = md_to_legacy(text)
         extra = {"reply_markup": to_botapi_markup(buttons)} if buttons else {}
@@ -2639,8 +2713,11 @@ class BotApiControl:
                 if "callback_query" in upd:          # a tapped button
                     cb = upd["callback_query"]
                     text = cb.get("data") or ""
-                    msg = {"chat": (cb.get("message") or {}).get("chat", {}),
-                           "from": cb.get("from", {})}
+                    src = cb.get("message") or {}
+                    msg = {"chat": src.get("chat", {}), "from": cb.get("from", {}),
+                           # tulis ulang pesan itu juga, jangan numpuk pesan baru:
+                           # kalau nggak, centang di pesan lama keliatan masih nyala
+                           "edit_id": src.get("message_id")}
                     log.info(f"tap {text!r} from {(cb.get('from') or {}).get('id')}")
                     try:
                         await self.call("answerCallbackQuery", callback_query_id=cb["id"])
@@ -2689,8 +2766,14 @@ class BotApiEvent:
         self.raw_text = text
         self.sender_id = (msg.get("from") or {}).get("id")
         self.date = msg.get("date")          # unix ts, lets /ping measure real lag
+        self.edit_id = msg.get("edit_id")    # set kalau ini datang dari tap tombol
 
     async def reply(self, text, buttons=None, **_kw):
+        if self.edit_id:
+            ok = await self._ctrl.edit(self._chat, self.edit_id, text, buttons)
+            self.edit_id = None              # balasan kedua dst. tetep jadi pesan baru
+            if ok:
+                return
         await self._ctrl.send(self._chat, text, buttons)
 
 
@@ -2702,8 +2785,15 @@ class _CBEvent:
         self._cb = cb
         self.raw_text = text
         self.sender_id = cb.sender_id
+        self.edit_id = True          # tap = tulis ulang pesannya, bukan bikin baru
 
     async def reply(self, text, **kw):
+        if self.edit_id:
+            self.edit_id = None
+            try:
+                return await self._cb.edit(text, **kw)
+            except Exception as e:
+                log.warning(f"edit failed: {e}")
         await self._cb.respond(text, **kw)
 
 

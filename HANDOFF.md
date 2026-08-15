@@ -134,6 +134,17 @@ Nomor `#n` ngikutin listing **terakhir** buat bot itu. Habis join/leave group ba
 
 **Source channel nggak akan pernah jadi target.** Dia otomatis kefilter dari `/listgroups` dan dari daftar target — biar CA yang lo relay nggak masuk balik ke channel yang lagi lo pantau (echo).
 
+### Auto kirim CA
+
+| Command | Fungsi |
+|---|---|
+| `/auto <bot>` | Panel auto-kirim: status hidup/mati, jumlah source & target, jeda, plus tombol pilih channel sumber & group tujuan. Kalau belum jalan, dia nyebutin apa yang kurang |
+| `/auto <bot> on` `off` | Nyalain / matiin auto-kirim (sama dengan `/dryrun <bot> off|on`, tapi `on` juga ngelepas pause) |
+
+Selama auto-kirim mati, CA tetep dibaca dan dicatat — cuma nggak dikirim. Jadi aman buat ngetes dulu.
+
+**Tombolnya nulis ulang pesan yang sama.** Tiap tap ngedit pesan itu juga (`editMessageText`), bukan bikin pesan baru — jadi nggak ada pesan lama nyangkut dengan centang yang udah nggak berlaku. Kalau Telegram nolak ngedit (pesannya kelamaan), otomatis jatuh ke kirim pesan baru.
+
 ### Anti-spam
 
 | Command | Fungsi |
