@@ -196,7 +196,11 @@ Hasilnya di-cache 6 jam per alamat, jadi repost nggak nanya ulang. Alamat yang d
 
 | Command | Fungsi |
 |---|---|
-| `/verify <bot> on` `off` | Nyalain/matiin saringan. Default **on**. Kesimpen per-bot di `fleet.json -> verify_token`. Tombolnya ada di `/auto` |
+| `/verify all on` `off` `strict` | Nyalain/matiin saringan buat **semua** userbot sekaligus (tanpa nama bot = `all`, karena saringan wallet nggak masuk akal kalau cuma nyala di satu akun). Default **on**. Kesimpen di `fleet.json -> verify_token` tiap bot |
+
+**`strict`** nutup satu-satunya lubang yang tersisa: kalau DexScreener nggak kejangkau, mode normal ngeloloskan alamatnya (fail-open), mode strict nahan. Paling aman, tapi pas API orang lagi down lo bisa kehilangan call beneran. Yang ditahan tetep dilaporin, jadi ketauan.
+
+**Gerbangnya ada sebelum antrean, bukan sebelum kirim.** Artinya alamat yang ditolak nggak pernah nyampe sender sama sekali — otomatis berlaku ke **semua** group tujuan, semua batch, semua bot. Nggak ada jalur per-group yang bisa kelewat. Satu-satunya yang sengaja nggak lewat gerbang ini: `/testca` (emang buat ngetes) dan `/broadcast` (teks manual lo sendiri).
 
 Kelemahannya jujur aja: token yang **baru banget** launching dan belum ada pair-nya di DexScreener bakal ikut kesaring. Kalau lo ngejar detik-detik pertama launch, matiin (`/verify <bot> off`) — konsekuensinya alamat wallet bisa lolos lagi.
 

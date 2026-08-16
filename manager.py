@@ -745,7 +745,12 @@ async def is_tradeable_token(ca):
 
 
 def verify_on(cfg):
-    return bool(cfg.get("verify_token", True))
+    return cfg.get("verify_token", True) is not False
+
+
+def verify_strict(cfg):
+    """strict = alamat yang nggak bisa dicek ikut dibuang (bukan diloloskan)."""
+    return str(cfg.get("verify_token", True)).lower() == "strict"
 
 
 async def passes_verification(bot, ca, chain, src):
@@ -757,9 +762,18 @@ async def passes_verification(bot, ca, chain, src):
     if verdict is True:
         return True
     if verdict is None:
-        # API nggak kejangkau: mending telat daripada kehilangan call beneran
-        log.warning(f"[{bot.name}] {ca[:12]}… nggak bisa diverifikasi — dilewatin gerbangnya")
-        return True
+        if not verify_strict(bot.cfg):
+            # API nggak kejangkau: mending telat daripada kehilangan call beneran
+            log.warning(f"[{bot.name}] {ca[:12]}… nggak bisa diverifikasi — diloloskan "
+                        f"(mode normal). Mau ditahan? `/verify {bot.name} strict`")
+            return True
+        log.warning(f"[{bot.name}] {ca[:12]}… nggak bisa diverifikasi — ditahan (mode strict)")
+        if reports_on():
+            await notify_admins(
+                f"🛑 **Ditahan (strict)** — nggak bisa diverifikasi\n`{ca}`\n"
+                f"📡 dari: {src}\n\n_DexScreener nggak kejangkau. Mode normal bakal "
+                f"ngeloloskan ini:_ `/verify {bot.name} on`")
+        return False
     bot.counters["not_token"] = bot.counters.get("not_token", 0) + 1
     log.info(f"[{bot.name}] {ca} dari {src} BUKAN token (nggak ada pair) — dibuang")
     if reports_on():
@@ -1509,8 +1523,8 @@ HELP = (
     "`/attribution <bot> <on|off>` — tampilin nama source\n"
     "`/chains <bot> <sol|evm|both>` · `/dedup <bot> <jam>`\n\n"
     "**Saringan**\n"
-    "`/verify <bot> on|off` — cek alamat ke DexScreener dulu; yang nggak punya "
-    "pair (alamat wallet) nggak dikirim\n\n"
+    "`/verify all on|off|strict` — cek alamat ke DexScreener dulu; yang nggak punya "
+    "pair (alamat wallet) nggak dikirim. `strict` = yang nggak bisa dicek ikut ditahan\n\n"
     "**Laporan**\n"
     "`/lapor on|off` — notif tiap CA dikirim (masuk group mana, gagal kenapa)\n\n"
     "**Operasi**\n"
@@ -1710,7 +1724,8 @@ def register_control(control):
                     f"🎯 Ke: **{len(b.targets)}** chat"
                     + (f" (👥 {n_grp} group · 📢 {n_ch} channel)" if n_ch else
                        f" (👥 {n_grp} group)" if n_grp else "") + "\n"
-                    f"🔎 Cek token (buang wallet): {'ON' if verify_on(b.cfg) else 'OFF'}\n"
+                    f"🔎 Cek token (buang wallet): "
+                    f"{'STRICT' if verify_strict(b.cfg) else 'ON' if verify_on(b.cfg) else 'OFF'}\n"
                     f"🔔 Laporan kirim: {'ON' if reports_on() else 'OFF'}\n"
                     f"⏱ Jeda antar group: {b.cfg.get('delay_between_groups_sec', 5)}s"
                     + (f" · batch {b.cfg['batch_window_sec'] // 60}m" if b.cfg.get("batch_window_sec") else "")
@@ -1722,8 +1737,8 @@ def register_control(control):
                     txt += "\n\n⚠️ _Belum jalan: " + "; ".join(blockers) + "_"
                 rows = [[("🔴 Matiin auto-kirim" if live else "🟢 Nyalain auto-kirim",
                           f"/auto {b.name} {'off' if live else 'on'}")],
-                        [(f"🔎 Cek token: {'ON' if verify_on(b.cfg) else 'OFF'}",
-                          f"/verify {b.name} {'off' if verify_on(b.cfg) else 'on'}"),
+                        [(f"🔎 Cek token: {'STRICT' if verify_strict(b.cfg) else 'ON' if verify_on(b.cfg) else 'OFF'}",
+                          f"/verify {b.name}"),
                          (f"🔔 Laporan: {'ON' if reports_on() else 'OFF'}",
                           f"/lapor {'off' if reports_on() else 'on'}")],
                         [("📡 Pilih channel sumber", f"/listchannels {b.name}"),
@@ -2317,25 +2332,39 @@ def register_control(control):
                 await finish_login(name)
 
             elif cmd == "verify":
-                bots = find_bots(args[0]) if args else []
+                # sengaja kena SEMUA bot sekaligus kalau nggak disebut namanya —
+                # saringan wallet nggak masuk akal kalau cuma nyala di satu akun
+                target = args[0] if args and (args[0] == "all" or find_bots(args[0])) else "all"
+                mode = next((a for a in args if a in ("on", "off", "strict")), None)
+                bots = find_bots(target) or FLEET
                 if not bots:
-                    return await reply("usage: `/verify <bot> <on|off>`")
-                b = bots[0]
-                if len(args) > 1 and args[1] in ("on", "off"):
-                    b.cfg["verify_token"] = args[1] == "on"
+                    return await reply("belum ada userbot")
+                if mode:
+                    for b in bots:
+                        b.cfg["verify_token"] = {"on": True, "off": False,
+                                                 "strict": "strict"}[mode]
                     save_fleet()
-                on = verify_on(b.cfg)
-                n_bad = b.counters.get("not_token", 0)
+                b = bots[0]
+                on, strict = verify_on(b.cfg), verify_strict(b.cfg)
+                state = "STRICT" if strict else ("ON" if on else "OFF")
+                n_bad = sum(x.counters.get("not_token", 0) for x in bots)
+                scope = f"{len(bots)} bot" if len(bots) > 1 else f"`{b.name}`"
                 await reply(
-                    f"🔎 **Cek token: {'ON' if on else 'OFF'}** — `{b.name}`\n\n"
+                    f"🔎 **Cek token: {state}** — {scope}\n\n"
                     + ("Tiap alamat dicek dulu ke DexScreener. Kalau nggak punya pair "
                        "yang diperdagangkan (alias kemungkinan **alamat wallet**), "
-                       "nggak dikirim." if on else
+                       "nggak dikirim.\n\n"
+                       + ("_Mode strict: alamat yang **nggak bisa dicek** (API down) ikut "
+                          "ditahan. Paling aman, tapi bisa kehilangan call pas API ngambek._"
+                          if strict else
+                          "_Kalau DexScreener lagi down, alamatnya tetep diloloskan biar "
+                          "call beneran nggak ilang. Mau ditahan juga?_ `/verify all strict`")
+                       if on else
                        "⚠️ Semua alamat dikirim apa adanya — termasuk alamat wallet "
                        "yang kesenggol dari post wallet-tracker.")
                     + (f"\n\nUdah nyaring **{n_bad}** alamat bukan-token." if n_bad else ""),
-                    [[(f"{'🔓 Matiin' if on else '🔎 Nyalain'} cek token",
-                       f"/verify {b.name} {'off' if on else 'on'}")],
+                    [[("🔓 Matiin", "/verify all off"), ("🔎 Normal", "/verify all on"),
+                      ("🛑 Strict", "/verify all strict")],
                      [("⬅️ Balik", f"/auto {b.name}")]])
 
             elif cmd in ("lapor", "report"):
@@ -3045,7 +3074,7 @@ BOT_COMMANDS = [
     ("log", "Log terakhir — /log 10"),
     ("version", "Mode, uptime, jumlah bot"),
     ("addnumber", "Tambah userbot (butuh api_id)"),
-    ("verify", "Cek token dulu, buang wallet — /verify <bot> on|off"),
+    ("verify", "Cek token dulu, buang wallet — /verify all on|off|strict"),
     ("lapor", "Laporan tiap kirim CA: on/off"),
     ("reset", "Hapus semua — userbot, source, target"),
     ("help", "Semua command"),
