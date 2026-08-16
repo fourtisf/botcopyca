@@ -180,6 +180,26 @@ Bawaannya **CA doang** — satu pesan = satu string CA, tanpa judul, link, nama 
 | `/template <bot> reset` | Balik ke CA doang |
 | `/template <bot> <teks>` | Bikin sendiri — placeholder `{ca}` `{chain}` `{links}` `{source}` |
 
+### Saringan wallet (verifikasi token)
+
+Alamat wallet dan alamat token **bentuknya identik** — EVM dua-duanya `0x` + 40 hex, Solana dua-duanya base58 32 byte. Jadi channel yang ngepost hasil wallet-tracker (`WR: 76% · PNL: +$39 · TXs: 156`) keliatan persis kayak call, dan alamat wallet-nya ikut kerelay.
+
+Nggak ada cara mastiin dari bentuk alamatnya. Yang bisa: tanya apakah alamat itu punya pair yang diperdagangkan. Token punya, wallet nggak.
+
+Tiap CA dicek ke `api.dexscreener.com/latest/dex/tokens/<ca>` sebelum masuk antrean:
+
+- **ada pair** → lanjut dikirim
+- **nggak ada pair** → dibuang, admin dikasih tau alamatnya + channel asalnya
+- **API nggak kejangkau** (dicoba 2x) → **tetep dikirim** — mending kelewat sekali daripada kehilangan call beneran
+
+Hasilnya di-cache 6 jam per alamat, jadi repost nggak nanya ulang. Alamat yang ditolak **nggak** dicatet di dedup db — kalau ternyata token baru yang belum kelisting, dia masih punya kesempatan lain kali.
+
+| Command | Fungsi |
+|---|---|
+| `/verify <bot> on` `off` | Nyalain/matiin saringan. Default **on**. Kesimpen per-bot di `fleet.json -> verify_token`. Tombolnya ada di `/auto` |
+
+Kelemahannya jujur aja: token yang **baru banget** launching dan belum ada pair-nya di DexScreener bakal ikut kesaring. Kalau lo ngejar detik-detik pertama launch, matiin (`/verify <bot> off`) — konsekuensinya alamat wallet bisa lolos lagi.
+
 ### Laporan kirim
 
 Tiap kali CA selesai difanout, admin dapet satu laporan — bukan satu per group, satu per pengiriman:

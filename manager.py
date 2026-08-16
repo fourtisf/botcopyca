@@ -704,6 +704,73 @@ def new_bot_cfg(name, session):
     }
 
 
+# ---------------------------------------------------------------- verifikasi token
+# Alamat wallet dan alamat token bentuknya identik (EVM: 0x + 40 hex, SOL: base58
+# 32 byte). Channel yang ngepost hasil wallet-tracker bakal keliatan persis kayak
+# call. Satu-satunya cara mastiin: tanya apakah alamat itu punya pair yang
+# diperdagangkan. Wallet nggak punya.
+
+DEX_TOKEN_API = "https://api.dexscreener.com/latest/dex/tokens/{}"
+TOKEN_CACHE = {}          # ca -> (verdict, waktu) — verdict: True/False/None
+TOKEN_CACHE_TTL = 6 * 3600
+VERIFY_TIMEOUT = 8
+
+
+def _dex_lookup(ca):
+    req = urllib.request.Request(DEX_TOKEN_API.format(ca),
+                                 headers={"User-Agent": "callrelay"})
+    with urllib.request.urlopen(req, timeout=VERIFY_TIMEOUT) as r:
+        return json.loads(r.read().decode())
+
+
+async def is_tradeable_token(ca):
+    """True = token beneran (ada pair-nya), False = bukan (kemungkinan wallet),
+    None = nggak bisa dicek (jaringan/API ngambek)."""
+    hit = TOKEN_CACHE.get(ca)
+    if hit and time.time() - hit[1] < TOKEN_CACHE_TTL:
+        return hit[0]
+    verdict = None
+    for attempt in (1, 2):
+        try:
+            data = await asyncio.to_thread(_dex_lookup, ca)
+            verdict = bool((data or {}).get("pairs"))
+            break
+        except Exception as e:
+            log.warning(f"cek token {ca[:10]}… gagal (percobaan {attempt}): {e}")
+            if attempt == 1:
+                await asyncio.sleep(1)
+    if verdict is not None:      # hasil 'nggak ketahuan' jangan di-cache
+        TOKEN_CACHE[ca] = (verdict, time.time())
+    return verdict
+
+
+def verify_on(cfg):
+    return bool(cfg.get("verify_token", True))
+
+
+async def passes_verification(bot, ca, chain, src):
+    """Gerbang sebelum CA masuk antrean. Kalau ketahuan bukan token, dibuang
+    dan dilaporin — biar ketauan channel mana yang nge-post wallet."""
+    if not verify_on(bot.cfg):
+        return True
+    verdict = await is_tradeable_token(ca)
+    if verdict is True:
+        return True
+    if verdict is None:
+        # API nggak kejangkau: mending telat daripada kehilangan call beneran
+        log.warning(f"[{bot.name}] {ca[:12]}… nggak bisa diverifikasi — dilewatin gerbangnya")
+        return True
+    bot.counters["not_token"] = bot.counters.get("not_token", 0) + 1
+    log.info(f"[{bot.name}] {ca} dari {src} BUKAN token (nggak ada pair) — dibuang")
+    if reports_on():
+        await notify_admins(
+            f"🚫 **Bukan token, nggak dikirim**\n`{ca}`\n"
+            f"📡 dari: {src}\n\n"
+            f"_Nggak ada pair yang diperdagangkan — kemungkinan alamat wallet. "
+            f"Matiin cek ini pakai_ `/verify {bot.name} off`")
+    return False
+
+
 def make_handler(bot):
     async def handler(event):
         try:
@@ -715,6 +782,8 @@ def make_handler(bot):
                 # inflight = queued by an earlier message, not committed yet
                 if ca in bot.inflight or already_posted(bot.name, ca, bot.cfg.get("dedup_hours", 0)):
                     bot.counters["dup_skips"] += 1
+                    continue
+                if not await passes_verification(bot, ca, chain, src):
                     continue
                 bot.inflight.add(ca)
                 log.info(f"[{bot.name}] NEW {chain.upper()} {ca} from {src} -> queue")
@@ -1050,6 +1119,8 @@ async def on_bot_message(chat, msg):
     for ca, chain in extract_cas(botapi_text(msg), bot.cfg.get("chains", ["sol", "evm"])):
         if ca in bot.inflight or already_posted(bot.name, ca, bot.cfg.get("dedup_hours", 0)):
             bot.counters["dup_skips"] += 1
+            continue
+        if not await passes_verification(bot, ca, chain, src):
             continue
         bot.inflight.add(ca)
         log.info(f"[{bot.name}] NEW {chain.upper()} {ca} from {src} -> queue")
@@ -1388,7 +1459,7 @@ def to_botapi_markup(rows):
 
 # Commands whose first argument is a bot name — see the auto-fill in on_cmd().
 BOT_ARG_CMDS = {
-    "bot", "auto", "join", "listchannels", "addsource", "delsource", "clearsource", "sources",
+    "bot", "auto", "verify", "join", "listchannels", "addsource", "delsource", "clearsource", "sources",
     "listgroups",
     "allow", "unallow", "groups", "mode", "titlefilter", "target", "batch", "cap",
     "quiet", "delay", "dryrun", "pause", "resume", "reload", "preview", "template",
@@ -1437,6 +1508,9 @@ HELP = (
     "`/template <bot> <teks|reset>` — format sendiri: `{ca}` `{chain}` `{links}` `{source}`\n"
     "`/attribution <bot> <on|off>` — tampilin nama source\n"
     "`/chains <bot> <sol|evm|both>` · `/dedup <bot> <jam>`\n\n"
+    "**Saringan**\n"
+    "`/verify <bot> on|off` — cek alamat ke DexScreener dulu; yang nggak punya "
+    "pair (alamat wallet) nggak dikirim\n\n"
     "**Laporan**\n"
     "`/lapor on|off` — notif tiap CA dikirim (masuk group mana, gagal kenapa)\n\n"
     "**Operasi**\n"
@@ -1636,6 +1710,7 @@ def register_control(control):
                     f"🎯 Ke: **{len(b.targets)}** chat"
                     + (f" (👥 {n_grp} group · 📢 {n_ch} channel)" if n_ch else
                        f" (👥 {n_grp} group)" if n_grp else "") + "\n"
+                    f"🔎 Cek token (buang wallet): {'ON' if verify_on(b.cfg) else 'OFF'}\n"
                     f"🔔 Laporan kirim: {'ON' if reports_on() else 'OFF'}\n"
                     f"⏱ Jeda antar group: {b.cfg.get('delay_between_groups_sec', 5)}s"
                     + (f" · batch {b.cfg['batch_window_sec'] // 60}m" if b.cfg.get("batch_window_sec") else "")
@@ -1647,7 +1722,9 @@ def register_control(control):
                     txt += "\n\n⚠️ _Belum jalan: " + "; ".join(blockers) + "_"
                 rows = [[("🔴 Matiin auto-kirim" if live else "🟢 Nyalain auto-kirim",
                           f"/auto {b.name} {'off' if live else 'on'}")],
-                        [(f"🔔 Laporan: {'ON' if reports_on() else 'OFF'}",
+                        [(f"🔎 Cek token: {'ON' if verify_on(b.cfg) else 'OFF'}",
+                          f"/verify {b.name} {'off' if verify_on(b.cfg) else 'on'}"),
+                         (f"🔔 Laporan: {'ON' if reports_on() else 'OFF'}",
                           f"/lapor {'off' if reports_on() else 'on'}")],
                         [("📡 Pilih channel sumber", f"/listchannels {b.name}"),
                          ("🎯 Pilih group tujuan", f"/listgroups {b.name}")],
@@ -2238,6 +2315,28 @@ def register_control(control):
                                        [[("❌ Batal", f"/cancel {name}")]])
                 p.pop("needs_password", None)
                 await finish_login(name)
+
+            elif cmd == "verify":
+                bots = find_bots(args[0]) if args else []
+                if not bots:
+                    return await reply("usage: `/verify <bot> <on|off>`")
+                b = bots[0]
+                if len(args) > 1 and args[1] in ("on", "off"):
+                    b.cfg["verify_token"] = args[1] == "on"
+                    save_fleet()
+                on = verify_on(b.cfg)
+                n_bad = b.counters.get("not_token", 0)
+                await reply(
+                    f"🔎 **Cek token: {'ON' if on else 'OFF'}** — `{b.name}`\n\n"
+                    + ("Tiap alamat dicek dulu ke DexScreener. Kalau nggak punya pair "
+                       "yang diperdagangkan (alias kemungkinan **alamat wallet**), "
+                       "nggak dikirim." if on else
+                       "⚠️ Semua alamat dikirim apa adanya — termasuk alamat wallet "
+                       "yang kesenggol dari post wallet-tracker.")
+                    + (f"\n\nUdah nyaring **{n_bad}** alamat bukan-token." if n_bad else ""),
+                    [[(f"{'🔓 Matiin' if on else '🔎 Nyalain'} cek token",
+                       f"/verify {b.name} {'off' if on else 'on'}")],
+                     [("⬅️ Balik", f"/auto {b.name}")]])
 
             elif cmd in ("lapor", "report"):
                 if args and args[0] in ("on", "off"):
@@ -2946,6 +3045,7 @@ BOT_COMMANDS = [
     ("log", "Log terakhir — /log 10"),
     ("version", "Mode, uptime, jumlah bot"),
     ("addnumber", "Tambah userbot (butuh api_id)"),
+    ("verify", "Cek token dulu, buang wallet — /verify <bot> on|off"),
     ("lapor", "Laporan tiap kirim CA: on/off"),
     ("reset", "Hapus semua — userbot, source, target"),
     ("help", "Semua command"),
