@@ -782,43 +782,53 @@ def verify_strict(cfg):
     return str(cfg.get("verify_token", True)).lower() == "strict"
 
 
-async def passes_verification(bot, ca, chain, src):
-    """Gerbang sebelum CA masuk antrean. Kalau ketahuan bukan token, dibuang
-    dan dilaporin — biar ketauan channel mana yang nge-post wallet."""
+async def enqueue_ca(bot, ca, chain, src, quiet=False, force=False):
+    """SATU-SATUNYA cara CA masuk antrean kirim.
+
+    Semua saringan ada di sini, jadi jalur baru (relay, tes, apa pun nanti)
+    otomatis kena gerbang yang sama. Jangan pernah manggil `bot.queue.put`
+    langsung — test_guard.py bakal gagal kalau ada yang nyoba.
+    -> (ok, alasan kalau ditolak)
+    """
     if is_junk_address(ca):
         bot.counters["not_token"] = bot.counters.get("not_token", 0) + 1
         log.info(f"[{bot.name}] {ca} dari {src} alamat mati/burn — dibuang")
-        if reports_on():
+        if reports_on() and not quiet:
             await notify_admins(f"🚫 **Alamat mati, nggak dikirim**\n`{ca}`\n📡 dari: {src}\n\n"
                                 f"_Burn/null address — ini ditolak selalu, walau `/verify` off._")
-        return False
-    if not verify_on(bot.cfg):
-        return True
-    verdict = await is_tradeable_token(ca)
-    if verdict is True:
-        return True
-    if verdict is None:
-        if not verify_strict(bot.cfg):
-            # API nggak kejangkau: mending telat daripada kehilangan call beneran
+        return False, "alamat mati/burn, **nggak akan pernah** dikirim"
+    if verify_on(bot.cfg):
+        verdict = await is_tradeable_token(ca)
+        if verdict is False:
+            bot.counters["not_token"] = bot.counters.get("not_token", 0) + 1
+            log.info(f"[{bot.name}] {ca} dari {src} BUKAN token (nggak ada pair) — dibuang")
+            if reports_on() and not quiet:
+                await notify_admins(
+                    f"🚫 **Bukan token, nggak dikirim**\n`{ca}`\n"
+                    f"📡 dari: {src}\n\n"
+                    f"_Nggak ada pair yang diperdagangkan — kemungkinan alamat wallet. "
+                    f"Matiin cek ini pakai_ `/verify {bot.name} off`")
+            return False, "bukan token (nggak ada pair yang diperdagangkan), nggak dikirim"
+        if verdict is None:
+            if verify_strict(bot.cfg):
+                log.warning(f"[{bot.name}] {ca[:12]}… nggak bisa diverifikasi — ditahan (strict)")
+                if reports_on() and not quiet:
+                    await notify_admins(
+                        f"🛑 **Ditahan (strict)** — nggak bisa diverifikasi\n`{ca}`\n"
+                        f"📡 dari: {src}\n\n_DexScreener nggak kejangkau. Mode normal bakal "
+                        f"ngeloloskan ini:_ `/verify {bot.name} on`")
+                return False, "nggak bisa dicek (API down), ditahan karena mode strict"
             log.warning(f"[{bot.name}] {ca[:12]}… nggak bisa diverifikasi — diloloskan "
                         f"(mode normal). Mau ditahan? `/verify {bot.name} strict`")
-            return True
-        log.warning(f"[{bot.name}] {ca[:12]}… nggak bisa diverifikasi — ditahan (mode strict)")
-        if reports_on():
-            await notify_admins(
-                f"🛑 **Ditahan (strict)** — nggak bisa diverifikasi\n`{ca}`\n"
-                f"📡 dari: {src}\n\n_DexScreener nggak kejangkau. Mode normal bakal "
-                f"ngeloloskan ini:_ `/verify {bot.name} on`")
-        return False
-    bot.counters["not_token"] = bot.counters.get("not_token", 0) + 1
-    log.info(f"[{bot.name}] {ca} dari {src} BUKAN token (nggak ada pair) — dibuang")
-    if reports_on():
-        await notify_admins(
-            f"🚫 **Bukan token, nggak dikirim**\n`{ca}`\n"
-            f"📡 dari: {src}\n\n"
-            f"_Nggak ada pair yang diperdagangkan — kemungkinan alamat wallet. "
-            f"Matiin cek ini pakai_ `/verify {bot.name} off`")
-    return False
+    # force cuma ngelewat dedup — saringan sampah & verifikasi di atas tetep jalan
+    if not force and (ca in bot.inflight
+                      or already_posted(bot.name, ca, bot.cfg.get("dedup_hours", 0))):
+        bot.counters["dup_skips"] += 1
+        return False, "CA ini udah pernah dikirim, ke-skip dedup"
+    bot.inflight.add(ca)
+    log.info(f"[{bot.name}] NEW {chain.upper()} {ca} from {src} -> queue")
+    await bot.queue.put((ca, chain, src))
+    return True, None
 
 
 def make_handler(bot):
@@ -829,15 +839,7 @@ def make_handler(bot):
                 return
             src = bot.source_names.get(pid, "unknown")
             for ca, chain in extract_cas(get_all_text(event.message), bot.cfg.get("chains", ["sol", "evm"])):
-                # inflight = queued by an earlier message, not committed yet
-                if ca in bot.inflight or already_posted(bot.name, ca, bot.cfg.get("dedup_hours", 0)):
-                    bot.counters["dup_skips"] += 1
-                    continue
-                if not await passes_verification(bot, ca, chain, src):
-                    continue
-                bot.inflight.add(ca)
-                log.info(f"[{bot.name}] NEW {chain.upper()} {ca} from {src} -> queue")
-                await bot.queue.put((ca, chain, src))
+                await enqueue_ca(bot, ca, chain, src)
         except Exception as e:
             log.error(f"[{bot.name}] handler error: {e}")
     return handler
@@ -1173,14 +1175,7 @@ async def on_bot_message(chat, msg):
         return
     src = bot.source_names.get(cid, chat.get("title") or str(cid))
     for ca, chain in extract_cas(botapi_text(msg), bot.cfg.get("chains", ["sol", "evm"])):
-        if ca in bot.inflight or already_posted(bot.name, ca, bot.cfg.get("dedup_hours", 0)):
-            bot.counters["dup_skips"] += 1
-            continue
-        if not await passes_verification(bot, ca, chain, src):
-            continue
-        bot.inflight.add(ca)
-        log.info(f"[{bot.name}] NEW {chain.upper()} {ca} from {src} -> queue")
-        await bot.queue.put((ca, chain, src))
+        await enqueue_ca(bot, ca, chain, src)
 
 
 async def attach_bot_relay(ctrl):
@@ -1513,6 +1508,9 @@ def to_botapi_markup(rows):
     ]})
 
 
+# Aksi sekali-jalan: hasilnya pesan baru, bukan nimpa panel yang tombolnya ditap.
+ACTION_CMDS = {"testca", "test", "broadcast", "dedupreset", "reload", "join"}
+
 # Commands whose first argument is a bot name — see the auto-fill in on_cmd().
 BOT_ARG_CMDS = {
     "bot", "auto", "verify", "join", "listchannels", "addsource", "delsource", "clearsource", "sources",
@@ -1629,6 +1627,12 @@ def register_control(control):
             only = FLEET[0].name
             if not args or (args[0] != "all" and not find_bots(args[0])):
                 args = [only] + args
+
+        # Tap tombol biasanya nulis ulang panelnya (biar centang nggak basi).
+        # Tapi tombol AKSI beda: hasilnya laporan, bukan layar — kalau nimpa,
+        # panelnya ilang dan kelihatan kayak command lain yang rusak.
+        if cmd in ACTION_CMDS:
+            event.edit_id = None
 
         async def reply(msg, buttons=None):
             kw = {}
@@ -1973,7 +1977,12 @@ def register_control(control):
                 ca_args = args[1:] if (first == "all" or find_bots(first)) else args
                 if not bots:
                     return await reply("belum ada userbot")
+                force = any(a == "force" for a in ca_args)
+                ca_args = [a for a in ca_args if a != "force"]
+                # tombol "Tes kirim" nggak nyebut CA -> pakai CA tes bawaan, dan
+                # dedup dilewat: kalau nggak, tombolnya cuma bisa dipakai sekali
                 ca = ca_args[0] if ca_args else "So11111111111111111111111111111111111111112"
+                force = force or not ca_args
                 chain = "evm" if ca.lower().startswith("0x") else "sol"
 
                 lines, queued = [], 0
@@ -1981,26 +1990,11 @@ def register_control(control):
                     if not b.targets:
                         lines.append(f"⚠️ `{b.name}` — belum ada group tujuan")
                         continue
-                    # alasan "ini alamat sampah" lebih penting daripada "udah pernah
-                    # dikirim" — jadi dicek duluan, biar user tau yang sebenernya
-                    if is_junk_address(ca):
-                        lines.append(f"🚫 `{b.name}` — alamat mati/burn, **nggak akan pernah** dikirim")
+                    ok, why = await enqueue_ca(b, ca, chain, "TEST", quiet=True, force=force)
+                    if not ok:
+                        icon = "🔁" if "dedup" in why else ("🛑" if "strict" in why else "🚫")
+                        lines.append(f"{icon} `{b.name}` — {why}")
                         continue
-                    if verify_on(b.cfg):
-                        verdict = await is_tradeable_token(ca)
-                        if verdict is False:
-                            lines.append(f"🚫 `{b.name}` — bukan token (nggak ada pair "
-                                         f"yang diperdagangkan), nggak dikirim")
-                            continue
-                        if verdict is None and verify_strict(b.cfg):
-                            lines.append(f"🛑 `{b.name}` — nggak bisa dicek (API down), "
-                                         f"ditahan karena mode strict")
-                            continue
-                    if ca in b.inflight or already_posted(b.name, ca, b.cfg.get("dedup_hours", 0)):
-                        lines.append(f"🔁 `{b.name}` — CA ini udah pernah dikirim, ke-skip dedup")
-                        continue
-                    b.inflight.add(ca)
-                    await b.queue.put((ca, chain, "TEST"))
                     queued += 1
                     dry = b.cfg.get("send_filter", {}).get("dry_run", False)
                     delay = b.cfg.get("delay_between_groups_sec", 5)
@@ -2018,8 +2012,8 @@ def register_control(control):
                 await reply(head + "\n".join(lines) + tail,
                             [[("📜 Log", "/log 10"), ("📊 Status", "/status")]]
                             if queued else
-                            [[("🔄 Reset dedup", "/dedupreset all"),
-                              ("🎯 Pilih group", "/listgroups")]]
+                            [[("📤 Kirim aja (lewat dedup)", f"/testca all {ca} force")],
+                             [("🔄 Reset dedup", "/dedupreset all")]]
                             if any("dedup" in l for l in lines) else
                             [[("📊 Status", "/status")]])
 

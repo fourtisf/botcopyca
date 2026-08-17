@@ -204,6 +204,10 @@ Hasilnya di-cache 6 jam per alamat, jadi repost nggak nanya ulang. Alamat yang d
 
 **Alamat EVM diseragamin ke huruf kecil** pas diekstrak. Alamat EVM itu case-insensitive, jadi `0xAbC…` dan `0xabc…` token yang sama — kalau nggak diseragamin, dedup jebol dan CA yang sama kekirim dua kali cuma gara-gara beda kapitalisasi.
 
+**Satu pintu masuk: `enqueue_ca()`.** Ini satu-satunya fungsi yang boleh manggil `bot.queue.put`. Semua saringan (alamat sampah → verifikasi token → dedup) ada di dalamnya, jadi jalur baru apa pun yang ditambahin nanti otomatis kena gerbang yang sama. Bug "alamat burn kekirim" kemarin persis karena ini belum ada: `/testca` masukin CA langsung ke antrean, muter gerbang.
+
+`test_guard.py` maksa aturan itu — dia baca `manager.py` pakai AST dan **gagal** kalau ada `queue.put` di luar `enqueue_ca`, atau kalau urutan saringannya kebalik, atau kalau cek alamat sampah kejebak di dalam `if verify_on(...)` (yang bikin `/verify off` ngelolosin burn address). Jadi pola bug-nya ketahuan pas tes, bukan pas kekirim ke group.
+
 **Gerbangnya ada sebelum antrean, bukan sebelum kirim.** Artinya alamat yang ditolak nggak pernah nyampe sender sama sekali — otomatis berlaku ke **semua** group tujuan, semua batch, semua bot. Nggak ada jalur per-group yang bisa kelewat. `/testca` — termasuk waktu lo paste CA polos — lewat gerbang yang **sama persis**. Cuma `/broadcast` (teks manual lo sendiri) yang bebas.
 
 Kelemahannya jujur aja: token yang **baru banget** launching dan belum ada pair-nya di DexScreener bakal ikut kesaring. Kalau lo ngejar detik-detik pertama launch, matiin (`/verify <bot> off`) — konsekuensinya alamat wallet bisa lolos lagi.
@@ -217,6 +221,10 @@ Kirim **alamat CA doang** ke chat control bot (tanpa command apa pun) → langsu
    → 📤 Jeffryyoung → 13 chat · kelar ~65s
    → (nyusul) ✅ Jeffryyoung — 13/13 group
 ```
+
+Tombol **🧪 Tes kirim** (tanpa nyebut CA) sengaja **ngelewat dedup** — kalau nggak, tombolnya cuma bisa dipakai sekali seumur hidup. CA yang lo sebut sendiri tetep kena dedup, tapi balasannya nyediain tombol *"Kirim aja (lewat dedup)"* kalau emang mau dipaksa. Saringan alamat sampah & verifikasi token **tetep jalan** — `force` cuma ngelewat dedup.
+
+Tombol aksi (`/testca`, `/test`, `/broadcast`, `/reload`, `/dedupreset`, `/join`) balesnya **pesan baru**, bukan nimpa panel tempat tombolnya ditap — hasil aksi itu laporan, bukan layar, dan panelnya masih kepake.
 
 Balasannya nyebut **perkiraan waktu kelar** (jumlah target × jeda antar group), jadi jelas kenapa nggak instan — 13 group × 5 detik = ~65 detik. Laporan hasilnya nyusul setelah semua group kelar.
 
