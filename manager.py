@@ -1981,16 +1981,23 @@ def register_control(control):
                     if not b.targets:
                         lines.append(f"⚠️ `{b.name}` — belum ada group tujuan")
                         continue
+                    # alasan "ini alamat sampah" lebih penting daripada "udah pernah
+                    # dikirim" — jadi dicek duluan, biar user tau yang sebenernya
+                    if is_junk_address(ca):
+                        lines.append(f"🚫 `{b.name}` — alamat mati/burn, **nggak akan pernah** dikirim")
+                        continue
+                    if verify_on(b.cfg):
+                        verdict = await is_tradeable_token(ca)
+                        if verdict is False:
+                            lines.append(f"🚫 `{b.name}` — bukan token (nggak ada pair "
+                                         f"yang diperdagangkan), nggak dikirim")
+                            continue
+                        if verdict is None and verify_strict(b.cfg):
+                            lines.append(f"🛑 `{b.name}` — nggak bisa dicek (API down), "
+                                         f"ditahan karena mode strict")
+                            continue
                     if ca in b.inflight or already_posted(b.name, ca, b.cfg.get("dedup_hours", 0)):
                         lines.append(f"🔁 `{b.name}` — CA ini udah pernah dikirim, ke-skip dedup")
-                        continue
-                    # tes pun lewat gerbang yang sama — kalau nggak, alamat burn
-                    # bisa nyebar ke semua group cuma gara-gara di-paste ke sini
-                    if is_junk_address(ca):
-                        lines.append(f"🚫 `{b.name}` — alamat mati/burn, nggak dikirim")
-                        continue
-                    if verify_on(b.cfg) and await is_tradeable_token(ca) is False:
-                        lines.append(f"🚫 `{b.name}` — bukan token (nggak ada pair), nggak dikirim")
                         continue
                     b.inflight.add(ca)
                     await b.queue.put((ca, chain, "TEST"))
@@ -2006,12 +2013,15 @@ def register_control(control):
                         else "**Nggak ada yang dikirim**\n\n")
                 tail = ("\n\n_Tunggu bentar — laporan hasilnya nyusul begitu semua group "
                         "kelar._" if queued else
-                        f"\n\n_Mau kirim ulang CA yang sama? `/dedupreset all` dulu._")
+                        ("\n\n_Mau kirim ulang CA yang sama? `/dedupreset all` dulu._"
+                         if any("dedup" in l for l in lines) else ""))
                 await reply(head + "\n".join(lines) + tail,
                             [[("📜 Log", "/log 10"), ("📊 Status", "/status")]]
                             if queued else
                             [[("🔄 Reset dedup", "/dedupreset all"),
-                              ("🎯 Pilih group", "/listgroups")]])
+                              ("🎯 Pilih group", "/listgroups")]]
+                            if any("dedup" in l for l in lines) else
+                            [[("📊 Status", "/status")]])
 
             elif cmd == "broadcast":
                 if len(args) < 2:
