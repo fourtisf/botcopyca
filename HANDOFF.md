@@ -206,7 +206,13 @@ Hasilnya di-cache 6 jam per alamat, jadi repost nggak nanya ulang. Alamat yang d
 
 **Satu pintu masuk: `enqueue_ca()`.** Ini satu-satunya fungsi yang boleh manggil `bot.queue.put`. Semua saringan (alamat sampah → verifikasi token → dedup) ada di dalamnya, jadi jalur baru apa pun yang ditambahin nanti otomatis kena gerbang yang sama. Bug "alamat burn kekirim" kemarin persis karena ini belum ada: `/testca` masukin CA langsung ke antrean, muter gerbang.
 
-`test_guard.py` maksa aturan itu — dia baca `manager.py` pakai AST dan **gagal** kalau ada `queue.put` di luar `enqueue_ca`, atau kalau urutan saringannya kebalik, atau kalau cek alamat sampah kejebak di dalam `if verify_on(...)` (yang bikin `/verify off` ngelolosin burn address). Jadi pola bug-nya ketahuan pas tes, bukan pas kekirim ke group.
+**Aturan kedua: bot nggak boleh ngarang alamat.** Satu-satunya alamat yang boleh hardcoded di `manager.py` cuma dua blok — `JUNK_ADDRESSES` (daftar hitam) dan `PREVIEW_DEMO` (contoh buat `/preview`, cuma dirender ke chat admin). Di luar itu, alamat harus datang dari user atau dari channel. Bug "bot ngirim Wrapped SOL ke 13 group" persis karena ada CA bawaan di jalur kirim.
+
+**Aturan ketiga: tiap laporan nyebut asal-usulnya.** `✅ Jeffryyoung — 9/13 group` diikuti `🧪 tes manual (dari kamu)` atau `📡 Crypto Tribe`. Tanpa ini, hasil tes dan call beneran keliatan sama — dan pas laporan telat 60 detik, kelihatan kayak bot ngirim CA yang salah.
+
+`test_guard.py` maksa aturan itu — dia baca `manager.py` pakai AST dan **gagal** kalau ada `queue.put` di luar `enqueue_ca`, atau kalau urutan saringannya kebalik, atau kalau cek alamat sampah kejebak di dalam `if verify_on(...)` (yang bikin `/verify off` ngelolosin burn address). …dan gagal juga kalau ada alamat hardcoded di luar dua blok itu, atau kalau laporan berhenti nyebut asal-usul. Jadi pola bug-nya ketahuan pas tes, bukan pas kekirim ke group.
+
+Tiap bug yang kejadian di produksi selama pengembangan ini punya tes sendiri — `test_login.py` (session ketuker, database locked), `test_verify.py` (wallet & burn address kerelay), `test_guard.py` (jalan pintas & alamat bawaan), `test_tap.py` (panel ketimpa), `test_boot.py` (crash pas start). Nggak ada yang cuma "udah dibenerin"; semuanya dikunci tes.
 
 **Gerbangnya ada sebelum antrean, bukan sebelum kirim.** Artinya alamat yang ditolak nggak pernah nyampe sender sama sekali — otomatis berlaku ke **semua** group tujuan, semua batch, semua bot. Nggak ada jalur per-group yang bisa kelewat. `/testca` — termasuk waktu lo paste CA polos — lewat gerbang yang **sama persis**. Cuma `/broadcast` (teks manual lo sendiri) yang bebas.
 

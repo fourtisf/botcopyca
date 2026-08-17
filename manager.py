@@ -739,6 +739,13 @@ def is_junk_address(ca):
     return False
 
 
+# Alamat contoh buat `/preview` doang — dirender ke chat admin, NGGAK pernah
+# masuk antrean kirim. test_guard.py maksa: alamat hardcoded cuma boleh di sini
+# sama di daftar hitam di atas. Di luar itu, alamat harus datang dari user atau
+# dari channel — bot nggak boleh ngarang alamat yang bisa nyampe ke group.
+PREVIEW_DEMO = [("So11111111111111111111111111111111111111112", "sol", "Alpha Calls"),
+                ("0x1f9840a85d5af5bf1d1762f925bdaddc4201f984", "evm", "Beta Signals")]
+
 DEX_TOKEN_API = "https://api.dexscreener.com/latest/dex/tokens/{}"
 TOKEN_CACHE = {}          # ca -> (verdict, waktu) — verdict: True/False/None
 TOKEN_CACHE_TTL = 6 * 3600
@@ -1233,7 +1240,11 @@ async def report_delivery(bot, items, report, quiet):
             f"Pilih dulu di `/listgroups {bot.name}`")
     head = (f"{'✅' if ok else '❌'} **{bot.name}** — {len(ok)}/{len(report)} group"
             + (f" · {len(items)} CA" if len(items) > 1 else ""))
-    lines = [head, ""]
+    # dari mana CA-nya — tanpa ini, hasil tes dan call beneran keliatan sama
+    asal = {src for _, _, src in items}
+    label = ("🧪 tes manual (dari kamu)" if asal == {"TEST"}
+             else "📡 " + " · ".join(sorted(asal))[:60])
+    lines = [head, label, ""]
     for ca, _, _ in items[:3]:
         lines.append(f"`{ca}`")
     if len(items) > 3:
@@ -1859,8 +1870,7 @@ def register_control(control):
                 if not bots:
                     return await reply("usage: `/preview <bot>`")
                 b = bots[0]
-                demo = [("So11111111111111111111111111111111111111112", "sol", "Alpha Calls"),
-                        ("0x1f9840a85d5af5bf1d1762f925bdaddc4201f984", "evm", "Beta Signals")]
+                demo = PREVIEW_DEMO
                 one = build_message(b.cfg, *demo[0])
                 out = f"**Preview `{b.name}` — pesan satuan**\n\n{one}"
                 if b.cfg.get("batch_window_sec"):
