@@ -299,7 +299,10 @@ def extract_cas(text, chains):
         return found
     if "evm" in chains:
         for m in EVM_RE.findall(text):
-            found.append((m, "evm"))
+            # alamat EVM itu case-insensitive: `0xAbC…` dan `0xabc…` token yang
+            # sama. Kalau nggak diseragamin, dedup & cache verifikasi jebol dan
+            # CA yang sama bisa kekirim dua kali.
+            found.append((m.lower(), "evm"))
     if "sol" in chains:
         for m in SOL_RE.findall(text):
             if is_valid_sol(m):
@@ -710,6 +713,32 @@ def new_bot_cfg(name, session):
 # call. Satu-satunya cara mastiin: tanya apakah alamat itu punya pair yang
 # diperdagangkan. Wallet nggak punya.
 
+# Alamat yang nggak akan pernah jadi call — burn/null/system address. Ini
+# ditolak SELALU: nggak peduli /verify lagi off atau API lagi mati.
+JUNK_ADDRESSES = {
+    "0x0000000000000000000000000000000000000000",   # null address
+    "0x000000000000000000000000000000000000dead",   # burn
+    "0xdead000000000000000042069420694206942069",   # burn (vanity)
+    "0x0000000000000000000000000000000000000001",
+    "11111111111111111111111111111111",             # SOL system program
+    "1nc1nerator11111111111111111111111111111111",  # SOL incinerator
+}
+
+
+def is_junk_address(ca):
+    """Alamat mati/burn — bukan token, nggak bakal pernah jadi call."""
+    s = str(ca).strip().lower()
+    if s in JUNK_ADDRESSES:
+        return True
+    if s.startswith("0x"):
+        body = s[2:]
+        if len(set(body)) <= 2 and body.count("0") >= 36:   # nyaris nol semua
+            return True
+        if body.count("0") >= 34 and body.endswith(("dead", "beef", "1234")):
+            return True
+    return False
+
+
 DEX_TOKEN_API = "https://api.dexscreener.com/latest/dex/tokens/{}"
 TOKEN_CACHE = {}          # ca -> (verdict, waktu) — verdict: True/False/None
 TOKEN_CACHE_TTL = 6 * 3600
@@ -756,6 +785,13 @@ def verify_strict(cfg):
 async def passes_verification(bot, ca, chain, src):
     """Gerbang sebelum CA masuk antrean. Kalau ketahuan bukan token, dibuang
     dan dilaporin — biar ketauan channel mana yang nge-post wallet."""
+    if is_junk_address(ca):
+        bot.counters["not_token"] = bot.counters.get("not_token", 0) + 1
+        log.info(f"[{bot.name}] {ca} dari {src} alamat mati/burn — dibuang")
+        if reports_on():
+            await notify_admins(f"🚫 **Alamat mati, nggak dikirim**\n`{ca}`\n📡 dari: {src}\n\n"
+                                f"_Burn/null address — ini ditolak selalu, walau `/verify` off._")
+        return False
     if not verify_on(bot.cfg):
         return True
     verdict = await is_tradeable_token(ca)
@@ -1947,6 +1983,14 @@ def register_control(control):
                         continue
                     if ca in b.inflight or already_posted(b.name, ca, b.cfg.get("dedup_hours", 0)):
                         lines.append(f"🔁 `{b.name}` — CA ini udah pernah dikirim, ke-skip dedup")
+                        continue
+                    # tes pun lewat gerbang yang sama — kalau nggak, alamat burn
+                    # bisa nyebar ke semua group cuma gara-gara di-paste ke sini
+                    if is_junk_address(ca):
+                        lines.append(f"🚫 `{b.name}` — alamat mati/burn, nggak dikirim")
+                        continue
+                    if verify_on(b.cfg) and await is_tradeable_token(ca) is False:
+                        lines.append(f"🚫 `{b.name}` — bukan token (nggak ada pair), nggak dikirim")
                         continue
                     b.inflight.add(ca)
                     await b.queue.put((ca, chain, "TEST"))

@@ -200,7 +200,11 @@ Hasilnya di-cache 6 jam per alamat, jadi repost nggak nanya ulang. Alamat yang d
 
 **`strict`** nutup satu-satunya lubang yang tersisa: kalau DexScreener nggak kejangkau, mode normal ngeloloskan alamatnya (fail-open), mode strict nahan. Paling aman, tapi pas API orang lagi down lo bisa kehilangan call beneran. Yang ditahan tetep dilaporin, jadi ketauan.
 
-**Gerbangnya ada sebelum antrean, bukan sebelum kirim.** Artinya alamat yang ditolak nggak pernah nyampe sender sama sekali — otomatis berlaku ke **semua** group tujuan, semua batch, semua bot. Nggak ada jalur per-group yang bisa kelewat. Satu-satunya yang sengaja nggak lewat gerbang ini: `/testca` (emang buat ngetes) dan `/broadcast` (teks manual lo sendiri).
+**Daftar hitam alamat mati.** Null address (`0x000…000`), burn address (`0x000…dEaD`), SOL system program, dan sejenisnya **ditolak selalu** — nggak peduli `/verify` lagi off atau API lagi mati. Alamat begitu nggak akan pernah jadi call.
+
+**Alamat EVM diseragamin ke huruf kecil** pas diekstrak. Alamat EVM itu case-insensitive, jadi `0xAbC…` dan `0xabc…` token yang sama — kalau nggak diseragamin, dedup jebol dan CA yang sama kekirim dua kali cuma gara-gara beda kapitalisasi.
+
+**Gerbangnya ada sebelum antrean, bukan sebelum kirim.** Artinya alamat yang ditolak nggak pernah nyampe sender sama sekali — otomatis berlaku ke **semua** group tujuan, semua batch, semua bot. Nggak ada jalur per-group yang bisa kelewat. `/testca` — termasuk waktu lo paste CA polos — lewat gerbang yang **sama persis**. Cuma `/broadcast` (teks manual lo sendiri) yang bebas.
 
 Kelemahannya jujur aja: token yang **baru banget** launching dan belum ada pair-nya di DexScreener bakal ikut kesaring. Kalau lo ngejar detik-detik pertama launch, matiin (`/verify <bot> off`) — konsekuensinya alamat wallet bisa lolos lagi.
 
