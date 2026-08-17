@@ -222,7 +222,9 @@ Kirim **alamat CA doang** ke chat control bot (tanpa command apa pun) → langsu
    → (nyusul) ✅ Jeffryyoung — 13/13 group
 ```
 
-Tombol **🧪 Tes kirim** (tanpa nyebut CA) sengaja **ngelewat dedup** — kalau nggak, tombolnya cuma bisa dipakai sekali seumur hidup. CA yang lo sebut sendiri tetep kena dedup, tapi balasannya nyediain tombol *"Kirim aja (lewat dedup)"* kalau emang mau dipaksa. Saringan alamat sampah & verifikasi token **tetep jalan** — `force` cuma ngelewat dedup.
+**CA yang lo paste sendiri nggak kena dedup** — lo ngetiknya sengaja, jadi kalau mau kirim ulang CA yang sama ya dikirim. Saringan alamat sampah & verifikasi token **tetep jalan**; `force` cuma ngelewat dedup, nggak pernah ngelewat saringan.
+
+Tombol **🧪 Tes kirim** nggak punya CA bawaan lagi. Dulu dia ngirim Wrapped SOL (`So1111…112`) ke semua group beneran — nggak ada gunanya buat yang baca, dan bikin bingung pas laporannya nongol (kelihatan kayak bot ngirim CA yang salah). Sekarang tombolnya cuma nyuruh lo paste CA-nya.
 
 Tombol aksi (`/testca`, `/test`, `/broadcast`, `/reload`, `/dedupreset`, `/join`) balesnya **pesan baru**, bukan nimpa panel tempat tombolnya ditap — hasil aksi itu laporan, bukan layar, dan panelnya masih kepake.
 

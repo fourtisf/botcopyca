@@ -1034,7 +1034,9 @@ def map_plain_text(raw):
     if FLEET and not raw.startswith("/"):
         cas = extract_cas(raw, ["sol", "evm"])
         if len(cas) == 1 and len(raw.split()) == 1:
-            return f"/testca all {cas[0][0]}"
+            # lo yang ngetik sendiri = keputusan sengaja, jadi dedup dilewat.
+            # Saringan alamat sampah & verifikasi token tetep jalan.
+            return f"/testca all {cas[0][0]} force"
     # cuma @username / link t.me -> langsung jadiin source (kalau botnya cuma satu,
     # jadi nggak ada yang perlu ditebak)
     toks = raw.split()
@@ -1789,7 +1791,7 @@ def register_control(control):
                           f"/lapor {'off' if reports_on() else 'on'}")],
                         [("📡 Pilih channel sumber", f"/listchannels {b.name}"),
                          ("🎯 Pilih group tujuan", f"/listgroups {b.name}")],
-                        [("🧪 Tes kirim sekarang", f"/testca {b.name}"),
+                        [("🧪 Tes kirim (paste CA)", f"/testca {b.name}"),
                          ("👁 Contoh pesan", f"/preview {b.name}")],
                         [("🛡 Anti-spam", "/antispam"), ("⬅️ Balik", f"/bot {b.name}")]]
                 await reply(txt, rows)
@@ -1979,10 +1981,19 @@ def register_control(control):
                     return await reply("belum ada userbot")
                 force = any(a == "force" for a in ca_args)
                 ca_args = [a for a in ca_args if a != "force"]
-                # tombol "Tes kirim" nggak nyebut CA -> pakai CA tes bawaan, dan
-                # dedup dilewat: kalau nggak, tombolnya cuma bisa dipakai sekali
-                ca = ca_args[0] if ca_args else "So11111111111111111111111111111111111111112"
-                force = force or not ca_args
+                if not ca_args:
+                    # Dulu di sini ada CA bawaan (Wrapped SOL) yang kekirim ke
+                    # semua group beneran — nggak ada gunanya buat yang baca.
+                    # Sekarang tesnya pakai CA punya lo sendiri.
+                    return await reply(
+                        "🧪 **Tes kirim**\n\n"
+                        "**Paste alamat CA-nya aja** ke chat ini — langsung dikirim ke "
+                        "semua group tujuan, nggak usah pakai command.\n\n"
+                        "_Alamat wallet & alamat mati tetep disaring. Yang lo paste sendiri "
+                        "nggak kena dedup, jadi boleh diulang._",
+                        [[("🎯 Lihat group tujuan", "/listgroups")],
+                         [("⬅️ Balik", f"/auto {bots[0].name}")]])
+                ca = ca_args[0]
                 chain = "evm" if ca.lower().startswith("0x") else "sol"
 
                 lines, queued = [], 0
@@ -3123,7 +3134,7 @@ BOT_COMMANDS = [
     ("target", "Jenis target — /target <bot> group|channel|both"),
     ("mode", "Mode filter — /mode <bot> allowlist|blocklist|all"),
     ("titlefilter", "Saring target by judul"),
-    ("testca", "Suntik CA palsu buat ngetes — /testca <bot>"),
+    ("testca", "Tes kirim — paste CA-nya, langsung ke semua group"),
     ("test", "Kirim pesan tes ke semua target"),
     ("broadcast", "Kirim pesan manual — /broadcast <bot> <teks>"),
     ("preview", "Contoh pesan yang bakal dikirim"),
