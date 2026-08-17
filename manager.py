@@ -713,7 +713,7 @@ def new_bot_cfg(name, session):
 DEX_TOKEN_API = "https://api.dexscreener.com/latest/dex/tokens/{}"
 TOKEN_CACHE = {}          # ca -> (verdict, waktu) — verdict: True/False/None
 TOKEN_CACHE_TTL = 6 * 3600
-VERIFY_TIMEOUT = 8
+VERIFY_TIMEOUT = 5      # relay balapan sama bot lain — jangan kelamaan nunggu
 
 
 def _dex_lookup(ca):
@@ -738,7 +738,7 @@ async def is_tradeable_token(ca):
         except Exception as e:
             log.warning(f"cek token {ca[:10]}… gagal (percobaan {attempt}): {e}")
             if attempt == 1:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
     if verdict is not None:      # hasil 'nggak ketahuan' jangan di-cache
         TOKEN_CACHE[ca] = (verdict, time.time())
     return verdict
@@ -991,6 +991,12 @@ def map_plain_text(raw):
         return f"/pass {waiting[-1]} {raw}"
     if PENDING_LOGINS and re.fullmatch(r"[\d\s\-]{4,20}", raw) and 4 <= len(digits) <= 8:
         return f"/code {list(PENDING_LOGINS)[-1]} {digits}"
+    # CA polos di chat admin = suntik ke pipeline, kirim ke semua group.
+    # Ini cara tes paling natural: tinggal paste CA-nya.
+    if FLEET and not raw.startswith("/"):
+        cas = extract_cas(raw, ["sol", "evm"])
+        if len(cas) == 1 and len(raw.split()) == 1:
+            return f"/testca all {cas[0][0]}"
     # cuma @username / link t.me -> langsung jadiin source (kalau botnya cuma satu,
     # jadi nggak ada yang perlu ditebak)
     toks = raw.split()
@@ -1924,29 +1930,44 @@ def register_control(control):
             # ---------------------------------------------------- sistem
             # ---------------------------------------------------- uji & kirim manual
             elif cmd == "testca":
-                bots = find_bots(args[0]) if args else []
+                # tanpa nama bot = semua bot. Ngirim CA polos ke chat ini juga
+                # nyampe ke sini (lihat map_plain_text).
+                first = args[0] if args else ""
+                bots = find_bots(first) if (first == "all" or find_bots(first)) else FLEET
+                ca_args = args[1:] if (first == "all" or find_bots(first)) else args
                 if not bots:
-                    return await reply("usage: `/testca <bot> [ca]`\n"
-                                       "nyuntik CA palsu ke pipeline — lewat filter, dedup, "
-                                       "batch, dry-run, semuanya. Buat mastiin relay jalan "
-                                       "tanpa nunggu call beneran.")
-                b = bots[0]
-                ca = args[1] if len(args) > 1 else "So11111111111111111111111111111111111111112"
+                    return await reply("belum ada userbot")
+                ca = ca_args[0] if ca_args else "So11111111111111111111111111111111111111112"
                 chain = "evm" if ca.lower().startswith("0x") else "sol"
-                if not b.targets:
-                    return await reply(f"`{b.name}` belum punya target — `/listgroups {b.name}` dulu")
-                if ca in b.inflight or already_posted(b.name, ca, b.cfg.get("dedup_hours", 0)):
-                    return await reply(f"CA itu udah pernah dipost, bakal ke-skip dedup.\n"
-                                       f"Pakai CA lain, atau `/dedupreset {b.name}` dulu.")
-                b.inflight.add(ca)
-                await b.queue.put((ca, chain, "TEST"))
-                dry = b.cfg.get("send_filter", {}).get("dry_run", False)
-                await reply(f"🧪 CA tes dimasukin ke antrean `{b.name}`\n"
-                            f"target: {len(b.targets)} chat · "
-                            + ("**dry-run** — cuma muncul di log, nggak beneran dikirim"
-                               if dry else "**live** — bakal beneran kekirim")
-                            + f"\n\ncek: `/log 10`",
-                            [[("📜 Log", "/log 10"), ("📊 Status", "/status")]])
+
+                lines, queued = [], 0
+                for b in bots:
+                    if not b.targets:
+                        lines.append(f"⚠️ `{b.name}` — belum ada group tujuan")
+                        continue
+                    if ca in b.inflight or already_posted(b.name, ca, b.cfg.get("dedup_hours", 0)):
+                        lines.append(f"🔁 `{b.name}` — CA ini udah pernah dikirim, ke-skip dedup")
+                        continue
+                    b.inflight.add(ca)
+                    await b.queue.put((ca, chain, "TEST"))
+                    queued += 1
+                    dry = b.cfg.get("send_filter", {}).get("dry_run", False)
+                    delay = b.cfg.get("delay_between_groups_sec", 5)
+                    eta = len(b.targets) * max(delay, 1)
+                    lines.append(
+                        f"{'🧪' if dry else '📤'} `{b.name}` → **{len(b.targets)} chat**"
+                        + (" · _dry-run, nggak beneran dikirim_" if dry
+                           else f" · kelar ~{eta}s"))
+                head = (f"**Kirim `{ca[:10]}…{ca[-6:]}`**\n\n" if queued
+                        else "**Nggak ada yang dikirim**\n\n")
+                tail = ("\n\n_Tunggu bentar — laporan hasilnya nyusul begitu semua group "
+                        "kelar._" if queued else
+                        f"\n\n_Mau kirim ulang CA yang sama? `/dedupreset all` dulu._")
+                await reply(head + "\n".join(lines) + tail,
+                            [[("📜 Log", "/log 10"), ("📊 Status", "/status")]]
+                            if queued else
+                            [[("🔄 Reset dedup", "/dedupreset all"),
+                              ("🎯 Pilih group", "/listgroups")]])
 
             elif cmd == "broadcast":
                 if len(args) < 2:

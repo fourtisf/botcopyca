@@ -204,6 +204,20 @@ Hasilnya di-cache 6 jam per alamat, jadi repost nggak nanya ulang. Alamat yang d
 
 Kelemahannya jujur aja: token yang **baru banget** launching dan belum ada pair-nya di DexScreener bakal ikut kesaring. Kalau lo ngejar detik-detik pertama launch, matiin (`/verify <bot> off`) — konsekuensinya alamat wallet bisa lolos lagi.
 
+### Tes kirim: cukup paste CA-nya
+
+Kirim **alamat CA doang** ke chat control bot (tanpa command apa pun) → langsung disuntik ke pipeline semua userbot dan dikirim ke seluruh group tujuan. Sama persis kayak `/testca all <ca>`.
+
+```
+0x4E8fc9E5a6D2b9C6e7ca8b923661CA4E78087777
+   → 📤 Jeffryyoung → 13 chat · kelar ~65s
+   → (nyusul) ✅ Jeffryyoung — 13/13 group
+```
+
+Balasannya nyebut **perkiraan waktu kelar** (jumlah target × jeda antar group), jadi jelas kenapa nggak instan — 13 group × 5 detik = ~65 detik. Laporan hasilnya nyusul setelah semua group kelar.
+
+Yang bikin nggak jadi kekirim disebutin per bot: belum ada group tujuan, atau CA-nya udah pernah dikirim (ke-skip dedup, ada tombol `/dedupreset`). Dua CA sekaligus dalam satu pesan **nggak** di-auto-kirim — biar nggak kepencet nyebar sesuatu yang cuma mau lo tempel.
+
 ### Laporan kirim
 
 Tiap kali CA selesai difanout, admin dapet satu laporan — bukan satu per group, satu per pengiriman:
